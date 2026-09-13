@@ -756,7 +756,7 @@ static void scalarProgramIntBranch(uint64_t regs[IREGS], const BProg& prog)
         if (++steps>maxSteps) break;
         const BInsn& in=prog.ins[pc];
         if (!prog.ok[pc]) { ++pc; continue; }         // float/mem => no-op
-        uint64_t& d=regs[in.dst]; const uint64_t s=regs[in.src];
+        uint64_t& d=regs[in.dst]; const uint64_t s = in.srcImm ? in.srcVal : regs[in.src];
         switch (in.op) {
             case B_IADD_RS: d+=(s<<in.shift)+in.imm; ++pc; break;
             case B_ISUB_R:  d-=s; ++pc; break;
