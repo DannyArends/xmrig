@@ -219,6 +219,17 @@ static constexpr int FREGS = 4;   // RandomX f-group registers
 // FSCAL mask 0x80F0000000000000 applied to the raw bits of each double
 static const uint64_t FSCAL_MASK = 0x80F0000000000000ULL;
 
+// E-register exponent/mantissa mask (RandomX keeps E-regs positive & bounded).
+static const uint64_t E_MANTISSA_MASK = (1ULL << 56) - 1;      // dynamicMantissaMask
+static const uint64_t E_EXP_MASK      = 0x3000000000000000ULL; // constExponentBits(0x300)<<52
+
+static inline __m512d emask(__m512d v) {
+    __m512i b = _mm512_castpd_si512(v);
+    b = _mm512_and_si512(b, _mm512_set1_epi64((long long)E_MANTISSA_MASK));
+    b = _mm512_or_si512 (b, _mm512_set1_epi64((long long)E_EXP_MASK));
+    return _mm512_castsi512_pd(b);
+}
+
 // batched: reg[k].lo / reg[k].hi are __m512d (8 lanes)
 struct BFReg { __m512d lo, hi; };
 
@@ -235,11 +246,11 @@ static void runFloatProgram(BFReg reg[FREGS], const FInsn* prog, int count)
         const BFReg s = reg[in.src];
         switch (in.op) {
             case F_FSWAP_R: { __m512d t = d.lo; d.lo = d.hi; d.hi = t; } break;
-            case F_FADD_R:  d.lo = _mm512_add_pd(d.lo, s.lo); d.hi = _mm512_add_pd(d.hi, s.hi); break;
-            case F_FSUB_R:  d.lo = _mm512_sub_pd(d.lo, s.lo); d.hi = _mm512_sub_pd(d.hi, s.hi); break;
-            case F_FMUL_R:  d.lo = _mm512_mul_pd(d.lo, s.lo); d.hi = _mm512_mul_pd(d.hi, s.hi); break;
-            case F_FSQRT_R: d.lo = _mm512_sqrt_pd(d.lo);      d.hi = _mm512_sqrt_pd(d.hi);      break;
-            case F_FSCAL_R: d.lo = fscal(d.lo);              d.hi = fscal(d.hi);               break;
+            case F_FADD_R: d.lo = _mm512_add_pd(d.lo, s.lo); d.hi = _mm512_add_pd(d.hi, s.hi); break;
+            case F_FSUB_R: d.lo = _mm512_sub_pd(d.lo, s.lo); d.hi = _mm512_sub_pd(d.hi, s.hi); break;
+            case F_FMUL_R: d.lo = _mm512_mul_pd(d.lo, s.lo); d.hi = _mm512_mul_pd(d.hi, s.hi); break;
+            case F_FSQRT_R: d.lo = _mm512_sqrt_pd(emask(d.lo)); d.hi = _mm512_sqrt_pd(emask(d.hi)); break;
+            case F_FSCAL_R: d.lo = fscal(d.lo); d.hi = fscal(d.hi); break;
         }
     }
 }
