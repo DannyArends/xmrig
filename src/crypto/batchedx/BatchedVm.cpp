@@ -347,7 +347,7 @@ int verifyIntegerOps(){
 
   for (int p = 0; p < PROGRAMS; ++p) {
     // random program (integer register ops only)
-    BInsn prog[PROGLEN];
+    BInsn prog[PROGLEN] = {};
     for (int i = 0; i < PROGLEN; ++i) {
       uint64_t r = rng();
       prog[i].op  = (BOp)(r % 10);
@@ -569,7 +569,7 @@ int verifyMemoryOps()
 
     for (int p = 0; p < PROGRAMS; ++p) {
         // random program of memory ops
-        BInsn prog[PROGLEN];
+        BInsn prog[PROGLEN] = {};
         for (int i = 0; i < PROGLEN; ++i) {
             uint64_t r = rng();
             prog[i].op      = memops[r % 7];
@@ -629,7 +629,7 @@ int verifyBranchOps()
     long fails = 0;
 
     for (int p = 0; p < PROGRAMS; ++p) {
-        BInsn prog[PROGLEN];
+        BInsn prog[PROGLEN] = {};
         for (int i = 0; i < PROGLEN; ++i) {
             uint64_t r = rng();
             // ~10% CBRANCH, rest integer register ops (0..9)
