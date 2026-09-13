@@ -739,7 +739,7 @@ static void runProgramIntBranch(uint64_t regs[IREGS][LANES], const BProg& prog)
             d=_mm512_mask_add_epi64(d,m,d,_mm512_set1_epi64((long long)in.imm));
             __mmask8 taken=_mm512_mask_cmpeq_epi64_mask(m,
                 _mm512_and_si512(d,_mm512_set1_epi64((long long)(uint64_t)in.memMask)),_mm512_setzero_si512());
-            for (int l=0;l<LANES;++l) if (pc[l]==pos) pc[l]=(taken&(1u<<l))?in.target:pos+1;
+            for (int l=0;l<LANES;++l) if (pc[l]==pos) pc[l]=(taken&(1u<<l))?(in.target+1):pos+1;
         } else {
             if (prog.ok[pos]) applyIntMasked(r,in,m);   // float/mem => no-op for 6a
             for (int l=0;l<LANES;++l) if (pc[l]==pos) ++pc[l];
@@ -768,7 +768,7 @@ static void scalarProgramIntBranch(uint64_t regs[IREGS], const BProg& prog)
             case B_ISWAP_R: if(in.dst!=in.src){uint64_t t=d;d=regs[in.src];regs[in.src]=t;} ++pc; break;
             case B_IMULH_R: d=(uint64_t)(((unsigned __int128)d*(unsigned __int128)s)>>64); ++pc; break;
             case B_ISMULH_R:d=(uint64_t)(((__int128)(int64_t)d*(__int128)(int64_t)s)>>64); ++pc; break;
-            case B_CBRANCH: d+=in.imm; if((d&(uint64_t)in.memMask)==0) pc=in.target; else ++pc; break;
+            case B_CBRANCH: d+=in.imm; if((d&(uint64_t)in.memMask)==0) pc=in.target+1; else ++pc; break;
             default: ++pc; break;
         }
     }
