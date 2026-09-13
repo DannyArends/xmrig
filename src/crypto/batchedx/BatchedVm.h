@@ -28,7 +28,8 @@ static constexpr int IREGS = 8;      // RandomX integer registers per lane
 enum BOp : uint8_t {
     B_IADD_RS, B_ISUB_R, B_IMUL_R, B_INEG_R, B_IXOR_R, B_IROR_R, B_IROL_R, B_ISWAP_R,
     B_IMULH_R, B_ISMULH_R,
-    B_IADD_M, B_ISUB_M, B_IMUL_M, B_IMULH_M, B_ISMULH_M, B_IXOR_M, B_ISTORE
+    B_IADD_M, B_ISUB_M, B_IMUL_M, B_IMULH_M, B_ISMULH_M, B_IXOR_M, B_ISTORE,
+    B_CBRANCH
 };
 
 struct BInsn {
@@ -37,7 +38,8 @@ struct BInsn {
     uint8_t  src;     // 0..7
     uint8_t  shift;   // IADD_RS shift (0..3)
     uint64_t imm;     // IADD_RS / memory immediate
-    uint32_t memMask; // scratchpad address mask (memory ops)
+    uint32_t memMask; // scratchpad address mask (memory ops) / condition mask (CBRANCH)
+    int16_t  target;  // CBRANCH backward-jump target pc
 };
 
 /* Run a batched integer-only program. regs[k] holds register k across 8 lanes
@@ -53,6 +55,9 @@ int verifyFloatOps();
 
 /* Stage 4: memory ops (scratchpad gather/scatter) self-test. Returns 0 on all-pass. */
 int verifyMemoryOps();
+
+/* Stage 5: CBRANCH (per-lane PC + masked execution) self-test. Returns 0 on all-pass. */
+int verifyBranchOps();
 
 } // namespace batchedx
 

@@ -197,6 +197,7 @@ int xmrig::Entry::exec(const Process &process, Id id)
         int rc = batchedx::verifyIntegerOps();
         rc |= batchedx::verifyFloatOps();
         rc |= batchedx::verifyMemoryOps();
+        rc |= batchedx::verifyBranchOps();
         return rc;
     }
 #   endif

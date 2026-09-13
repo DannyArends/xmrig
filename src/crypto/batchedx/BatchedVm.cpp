@@ -226,6 +226,114 @@ void runMemoryProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count,
 }
 
 
+
+// ---- Stage 5: CBRANCH via per-lane PC + masked execution ----------------------
+//
+// Approach A: each lane has its own pc. We step a shared position = min active pc;
+// each instruction executes only on lanes whose pc == that position (active mask);
+// active lanes advance pc (or jump on a taken CBRANCH). Correct for arbitrary
+// backward-jump divergence. Only integer register ops + CBRANCH here (memory/float
+// divergence follow the same masking pattern in the full VM).
+
+// helper: apply one integer-register instruction to r[], only on masked lanes
+static inline void applyIntMasked(__m512i r[IREGS], const BInsn& in, __mmask8 m)
+{
+    __m512i& d = r[in.dst];
+    const __m512i s = r[in.src];
+    switch (in.op) {
+        case B_IADD_RS: d = _mm512_mask_add_epi64(d, m, d,
+                            _mm512_add_epi64(_mm512_slli_epi64(s, in.shift), _mm512_set1_epi64((long long)in.imm))); break;
+        case B_ISUB_R:  d = _mm512_mask_sub_epi64(d, m, d, s); break;
+        case B_IMUL_R:  d = _mm512_mask_mullo_epi64(d, m, d, s); break;
+        case B_INEG_R:  d = _mm512_mask_add_epi64(d, m, _mm512_xor_si512(d, _mm512_set1_epi64(-1)), _mm512_set1_epi64(1)); break;
+        case B_IXOR_R:  d = _mm512_mask_xor_epi64(d, m, d, s); break;
+        case B_IROR_R:  d = _mm512_mask_rorv_epi64(d, m, d, _mm512_and_si512(s, _mm512_set1_epi64(63))); break;
+        case B_IROL_R:  d = _mm512_mask_rolv_epi64(d, m, d, _mm512_and_si512(s, _mm512_set1_epi64(63))); break;
+        case B_IMULH_R: d = _mm512_mask_blend_epi64(m, d, mulhi_epu64(d, s)); break;
+        case B_ISMULH_R:d = _mm512_mask_blend_epi64(m, d, mulhi_epi64(d, s)); break;
+        case B_ISWAP_R: if (in.dst != in.src) {   // masked swap
+                            __m512i t = d;
+                            d          = _mm512_mask_blend_epi64(m, d, r[in.src]);
+                            r[in.src]  = _mm512_mask_blend_epi64(m, r[in.src], t);
+                        } break;
+        default: break;
+    }
+}
+
+// batched program with CBRANCH. Uses per-lane pc.
+void runBranchProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count)
+{
+    __m512i r[IREGS];
+    for (int k = 0; k < IREGS; ++k) r[k] = _mm512_loadu_si512((const void*)regs[k]);
+
+    int pc[LANES];
+    for (int l = 0; l < LANES; ++l) pc[l] = 0;
+
+    // safety bound to guarantee termination in the test (real VM relies on RandomX
+    // structure; here we cap total steps generously)
+    long steps = 0, maxSteps = (long)count * 64;
+
+    for (;;) {
+        // find min active pc
+        int pos = count;
+        for (int l = 0; l < LANES; ++l) if (pc[l] < count && pc[l] < pos) pos = pc[l];
+        if (pos >= count) break;                 // all lanes done
+        if (++steps > maxSteps) break;
+
+        // active mask = lanes at this position
+        __mmask8 m = 0;
+        for (int l = 0; l < LANES; ++l) if (pc[l] == pos) m |= (1u << l);
+
+        const BInsn& in = prog[pos];
+
+        if (in.op == B_CBRANCH) {
+            // dst += imm ; if ((dst & memMask)==0) pc=target else pc++  (per active lane)
+            __m512i& d = r[in.dst];
+            d = _mm512_mask_add_epi64(d, m, d, _mm512_set1_epi64((long long)in.imm));
+            __mmask8 taken = _mm512_mask_cmpeq_epi64_mask(m,
+                                _mm512_and_si512(d, _mm512_set1_epi64((long long)(uint64_t)in.memMask)),
+                                _mm512_setzero_si512());
+            for (int l = 0; l < LANES; ++l) if (pc[l] == pos) {
+                pc[l] = (taken & (1u << l)) ? in.target : pos + 1;
+            }
+        } else {
+            applyIntMasked(r, in, m);
+            for (int l = 0; l < LANES; ++l) if (pc[l] == pos) ++pc[l];
+        }
+    }
+
+    for (int k = 0; k < IREGS; ++k) _mm512_storeu_si512((void*)regs[k], r[k]);
+}
+
+// scalar reference: real pc with jumps
+static void scalarBranchProgram(uint64_t regs[IREGS], const BInsn* prog, int count)
+{
+    long steps = 0, maxSteps = (long)count * 64;
+    for (int pc = 0; pc < count; ) {
+        if (++steps > maxSteps) break;
+        const BInsn& in = prog[pc];
+        uint64_t& d = regs[in.dst];
+        const uint64_t s = regs[in.src];
+        switch (in.op) {
+            case B_IADD_RS: d += (s << in.shift) + in.imm; ++pc; break;
+            case B_ISUB_R:  d -= s; ++pc; break;
+            case B_IMUL_R:  d *= s; ++pc; break;
+            case B_INEG_R:  d = ~d + 1; ++pc; break;
+            case B_IXOR_R:  d ^= s; ++pc; break;
+            case B_IROR_R:  d = s_rotr(d, (unsigned)(s & 63)); ++pc; break;
+            case B_IROL_R:  d = s_rotl(d, (unsigned)(s & 63)); ++pc; break;
+            case B_ISWAP_R: if (in.dst != in.src) { uint64_t t=d; d=regs[in.src]; regs[in.src]=t; } ++pc; break;
+            case B_IMULH_R: d = (uint64_t)(((unsigned __int128)d*(unsigned __int128)s)>>64); ++pc; break;
+            case B_ISMULH_R:d = (uint64_t)(((__int128)(int64_t)d*(__int128)(int64_t)s)>>64); ++pc; break;
+            case B_CBRANCH: d += in.imm;
+                            if ((d & (uint64_t)in.memMask) == 0) pc = in.target; else ++pc;
+                            break;
+            default: ++pc; break;
+        }
+    }
+}
+
+
 int verifyIntegerOps(){
   printf("== BatchedVm Stage 1: integer ops verify ==\n");
   rng_s = 0x9e3779b97f4a7c15ULL;
@@ -494,6 +602,69 @@ int verifyMemoryOps()
             for (uint64_t w = 0; w < spWords; ++w)
                 if (spB[lane*spWords + w] != spS[lane][w]) {
                     if (fails < 5) printf("  MISMATCH prog %d lane %d sp[%llu]\n", p, lane, (unsigned long long)w);
+                    ++fails;
+                }
+    }
+
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
+    return fails == 0 ? 0 : 1;
+}
+
+
+
+
+// ---- Stage 5 self-test: CBRANCH --------------------------------------------
+
+int verifyBranchOps()
+{
+    printf("== BatchedVm Stage 5: branch (CBRANCH) verify ==\n");
+    rng_s = 0xb7e151628aed2a6bULL ^ 0x9e3779b97f4a7c15ULL;
+
+    const int PROGRAMS = 20000;
+    const int PROGLEN  = 256;
+    long fails = 0;
+
+    for (int p = 0; p < PROGRAMS; ++p) {
+        BInsn prog[PROGLEN];
+        for (int i = 0; i < PROGLEN; ++i) {
+            uint64_t r = rng();
+            // ~10% CBRANCH, rest integer register ops (0..9)
+            if ((r % 10) == 0) {
+                prog[i].op      = B_CBRANCH;
+                prog[i].dst     = (r >> 8) & 7;
+                prog[i].imm     = rng();
+                // condition mask: a few bits high enough that "==0" is plausible but not
+                // always taken (mirrors RandomX ConditionMask placement)
+                prog[i].memMask = (uint32_t)(0xffU << 8);   // bits 8..15
+                prog[i].target  = (int16_t)(i > 0 ? (rng() % i) : 0);  // backward target
+                prog[i].src     = 0;
+                prog[i].shift   = 0;
+            } else {
+                prog[i].op      = (BOp)(r % 10);
+                prog[i].dst     = (r >> 8)  & 7;
+                prog[i].src     = (r >> 16) & 7;
+                prog[i].shift   = (r >> 24) & 3;
+                prog[i].imm     = rng();
+                prog[i].memMask = 0;
+                prog[i].target  = 0;
+            }
+        }
+
+        uint64_t batched[IREGS][LANES];
+        uint64_t scalar [LANES][IREGS];
+        for (int lane = 0; lane < LANES; ++lane)
+            for (int k = 0; k < IREGS; ++k) { uint64_t v = rng(); scalar[lane][k] = v; batched[k][lane] = v; }
+
+        runBranchProgram(batched, prog, PROGLEN);
+        for (int lane = 0; lane < LANES; ++lane)
+            scalarBranchProgram(scalar[lane], prog, PROGLEN);
+
+        for (int lane = 0; lane < LANES; ++lane)
+            for (int k = 0; k < IREGS; ++k)
+                if (batched[k][lane] != scalar[lane][k]) {
+                    if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d: b=%016llx s=%016llx\n",
+                        p, lane, k, (unsigned long long)batched[k][lane], (unsigned long long)scalar[lane][k]);
                     ++fails;
                 }
     }
