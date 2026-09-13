@@ -193,7 +193,11 @@ int xmrig::Entry::exec(const Process &process, Id id)
 
 #   ifdef XMRIG_FEATURE_BATCHEDX
     case BatchedxVerify:
-        return batchedx::verifyIntegerOps();
+    {
+        int rc = batchedx::verifyIntegerOps();
+        rc |= batchedx::verifyFloatOps();
+        return rc;
+    }
 #   endif
 
     default:

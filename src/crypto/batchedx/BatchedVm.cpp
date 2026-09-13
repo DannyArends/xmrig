@@ -199,5 +199,134 @@ int verifyIntegerOps(){
 }
 
 
+
+// ============================================================================
+// Stage 3: batched float register ops (FSWAP_R, FADD_R, FSUB_R, FMUL_R,
+// FSQRT_R, FSCAL_R). Each RandomX float register is 2 doubles per lane; across
+// 8 lanes we hold it as two __m512d: 'lo' = element 0 of each lane's pair,
+// 'hi' = element 1. Verified bit-exact against scalar __m128d semantics (default
+// rounding mode; CFROUND handled in a later stage).
+// ============================================================================
+
+namespace {
+
+enum FOp : uint8_t { F_FSWAP_R, F_FADD_R, F_FSUB_R, F_FMUL_R, F_FSQRT_R, F_FSCAL_R };
+
+struct FInsn { FOp op; uint8_t dst; uint8_t src; };   // dst/src index 0..FREGS-1
+
+static constexpr int FREGS = 4;   // RandomX f-group registers
+
+// FSCAL mask 0x80F0000000000000 applied to the raw bits of each double
+static const uint64_t FSCAL_MASK = 0x80F0000000000000ULL;
+
+// batched: reg[k].lo / reg[k].hi are __m512d (8 lanes)
+struct BFReg { __m512d lo, hi; };
+
+static inline __m512d fscal(__m512d v) {
+    const __m512i m = _mm512_set1_epi64((long long)FSCAL_MASK);
+    return _mm512_castsi512_pd(_mm512_xor_si512(_mm512_castpd_si512(v), m));
+}
+
+static void runFloatProgram(BFReg reg[FREGS], const FInsn* prog, int count)
+{
+    for (int i = 0; i < count; ++i) {
+        const FInsn& in = prog[i];
+        BFReg& d = reg[in.dst];
+        const BFReg s = reg[in.src];
+        switch (in.op) {
+            case F_FSWAP_R: { __m512d t = d.lo; d.lo = d.hi; d.hi = t; } break;
+            case F_FADD_R:  d.lo = _mm512_add_pd(d.lo, s.lo); d.hi = _mm512_add_pd(d.hi, s.hi); break;
+            case F_FSUB_R:  d.lo = _mm512_sub_pd(d.lo, s.lo); d.hi = _mm512_sub_pd(d.hi, s.hi); break;
+            case F_FMUL_R:  d.lo = _mm512_mul_pd(d.lo, s.lo); d.hi = _mm512_mul_pd(d.hi, s.hi); break;
+            case F_FSQRT_R: d.lo = _mm512_sqrt_pd(d.lo);      d.hi = _mm512_sqrt_pd(d.hi);      break;
+            case F_FSCAL_R: d.lo = fscal(d.lo);              d.hi = fscal(d.hi);               break;
+        }
+    }
+}
+
+// scalar reference: each register is 2 doubles [0]=lo [1]=hi
+static void scalarFloatProgram(double reg[FREGS][2], const FInsn* prog, int count)
+{
+    for (int i = 0; i < count; ++i) {
+        const FInsn& in = prog[i];
+        double* d = reg[in.dst];
+        const double* s = reg[in.src];
+        switch (in.op) {
+            case F_FSWAP_R: { double t = d[0]; d[0] = d[1]; d[1] = t; } break;
+            case F_FADD_R:  d[0] += s[0]; d[1] += s[1]; break;
+            case F_FSUB_R:  d[0] -= s[0]; d[1] -= s[1]; break;
+            case F_FMUL_R:  d[0] *= s[0]; d[1] *= s[1]; break;
+            case F_FSQRT_R: d[0] = __builtin_sqrt(d[0]); d[1] = __builtin_sqrt(d[1]); break;
+            case F_FSCAL_R: {
+                uint64_t b0, b1; memcpy(&b0, &d[0], 8); memcpy(&b1, &d[1], 8);
+                b0 ^= FSCAL_MASK; b1 ^= FSCAL_MASK;
+                memcpy(&d[0], &b0, 8); memcpy(&d[1], &b1, 8);
+            } break;
+        }
+    }
+}
+
+} // anonymous namespace
+
+int verifyFloatOps()
+{
+    printf("== BatchedVm Stage 3: float ops verify ==\n");
+    rng_s = 0xd1b54a32d192 ^ 0x9e3779b97f4a7c15ULL;
+
+    const int PROGRAMS = 20000;
+    const int PROGLEN  = 256;
+    long fails = 0;
+
+    for (int p = 0; p < PROGRAMS; ++p) {
+        FInsn prog[PROGLEN];
+        for (int i = 0; i < PROGLEN; ++i) {
+            uint64_t r = rng();
+            prog[i].op  = (FOp)(r % 6);
+            prog[i].dst = (r >> 8)  & 3;
+            prog[i].src = (r >> 16) & 3;
+        }
+
+        // random finite doubles for 8 lanes x FREGS x 2
+        BFReg batched[FREGS];
+        double scalar[LANES][FREGS][2];
+        for (int k = 0; k < FREGS; ++k) {
+            double lo[LANES], hi[LANES];
+            for (int lane = 0; lane < LANES; ++lane) {
+                // build a finite double in a modest range to avoid inf/nan divergence noise
+                uint64_t r0 = rng(), r1 = rng();
+                double v0 = 1.0 + (double)(r0 & 0xffffffff) / 4294967296.0 * 1e6;
+                double v1 = 1.0 + (double)(r1 & 0xffffffff) / 4294967296.0 * 1e6;
+                lo[lane] = v0; hi[lane] = v1;
+                scalar[lane][k][0] = v0; scalar[lane][k][1] = v1;
+            }
+            batched[k].lo = _mm512_loadu_pd(lo);
+            batched[k].hi = _mm512_loadu_pd(hi);
+        }
+
+        runFloatProgram(batched, prog, PROGLEN);
+        for (int lane = 0; lane < LANES; ++lane)
+            scalarFloatProgram(scalar[lane], prog, PROGLEN);
+
+        // diff by raw bits (exact)
+        for (int k = 0; k < FREGS; ++k) {
+            double blo[LANES], bhi[LANES];
+            _mm512_storeu_pd(blo, batched[k].lo);
+            _mm512_storeu_pd(bhi, batched[k].hi);
+            for (int lane = 0; lane < LANES; ++lane) {
+                uint64_t xb, xs;
+                memcpy(&xb, &blo[lane], 8); memcpy(&xs, &scalar[lane][k][0], 8);
+                if (xb != xs) { if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d.lo\n", p, lane, k); ++fails; }
+                memcpy(&xb, &bhi[lane], 8); memcpy(&xs, &scalar[lane][k][1], 8);
+                if (xb != xs) { if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d.hi\n", p, lane, k); ++fails; }
+            }
+        }
+    }
+
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
+    return fails == 0 ? 0 : 1;
+}
+
+
 } // namespace batchedx
 } // namespace xmrig

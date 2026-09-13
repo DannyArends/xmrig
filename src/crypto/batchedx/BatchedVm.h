@@ -46,6 +46,9 @@ void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count
  * Returns 0 on all-pass. */
 int verifyIntegerOps();
 
+/* Stage 3: float register ops self-test. Returns 0 on all-pass. */
+int verifyFloatOps();
+
 } // namespace batchedx
 
 
