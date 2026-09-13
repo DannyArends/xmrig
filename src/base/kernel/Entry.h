@@ -40,7 +40,10 @@ public:
         Usage,
         Version,
         Topo,
-        Platforms
+        Platforms,
+        #ifdef XMRIG_FEATURE_BATCHEDX
+          BatchedxVerify
+        #endif
     };
 
     static Id get(const Process &process);

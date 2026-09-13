@@ -38,6 +38,10 @@
 #   include "backend/opencl/wrappers/OclPlatform.h"
 #endif
 
+#ifdef XMRIG_FEATURE_BATCHEDX
+#   include "crypto/batchedx/BatchedVm.h"
+#endif
+
 #include "base/kernel/Entry.h"
 #include "base/kernel/Process.h"
 #include "core/config/usage.h"
@@ -155,6 +159,11 @@ xmrig::Entry::Id xmrig::Entry::get(const Process &process)
     }
 #   endif
 
+#   ifdef XMRIG_FEATURE_BATCHEDX
+    if (args.hasArg("--batchedx-verify")) {
+        return BatchedxVerify;
+    }
+#   endif
     return Default;
 }
 
@@ -180,6 +189,11 @@ int xmrig::Entry::exec(const Process &process, Id id)
             OclPlatform::print();
         }
         return 0;
+#   endif
+
+#   ifdef XMRIG_FEATURE_BATCHEDX
+    case BatchedxVerify:
+        return batchedx::verifyIntegerOps();
 #   endif
 
     default:

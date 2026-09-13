@@ -1,6 +1,10 @@
 /* XMRig — batched AVX-512 RandomX (8-lane), header.
  *
  * Compiled in only when WITH_BATCHEDX=ON (XMRIG_FEATURE_BATCHEDX).
+ *
+ * Stage 1: an 8-lane interpreter for the RandomX INTEGER register ops. Registers are
+ * held as one __m512i per register index (lane = nonce). Each op is applied across all
+ * 8 lanes at once. Verified bit-exact against scalar semantics by verifyIntegerOps().
  */
 
 #ifndef XMRIG_BATCHEDVM_H
@@ -14,11 +18,34 @@
 namespace xmrig {
 
 
-class BatchedVm
-{
-public:
-    static constexpr int LANES = 8;             // AVX-512 = 8 x 64-bit lanes
+namespace batchedx {
+
+static constexpr int LANES = 8;      // AVX-512 = 8 x 64-bit lanes
+static constexpr int IREGS = 8;      // RandomX integer registers per lane
+
+// A batched instruction (integer register ops only, for Stage 1). Register operands
+// are indices 0..7 (not pointers), so the same decoded instruction drives all lanes.
+enum BOp : uint8_t {
+    B_IADD_RS, B_ISUB_R, B_IMUL_R, B_INEG_R, B_IXOR_R, B_IROR_R, B_IROL_R, B_ISWAP_R
 };
+
+struct BInsn {
+    BOp      op;
+    uint8_t  dst;     // 0..7
+    uint8_t  src;     // 0..7
+    uint8_t  shift;   // IADD_RS shift (0..3)
+    uint64_t imm;     // IADD_RS immediate
+};
+
+/* Run a batched integer-only program. regs[k] holds register k across 8 lanes
+ * (regs is IREGS x LANES uint64). Applies each instruction across all lanes. */
+void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count);
+
+/* Self-test: random integer-only programs, batched vs scalar reference, bit-exact.
+ * Returns 0 on all-pass. */
+int verifyIntegerOps();
+
+} // namespace batchedx
 
 
 } // namespace xmrig
