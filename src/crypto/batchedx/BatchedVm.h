@@ -26,7 +26,8 @@ static constexpr int IREGS = 8;      // RandomX integer registers per lane
 // A batched instruction (integer register ops only, for Stage 1). Register operands
 // are indices 0..7 (not pointers), so the same decoded instruction drives all lanes.
 enum BOp : uint8_t {
-    B_IADD_RS, B_ISUB_R, B_IMUL_R, B_INEG_R, B_IXOR_R, B_IROR_R, B_IROL_R, B_ISWAP_R
+    B_IADD_RS, B_ISUB_R, B_IMUL_R, B_INEG_R, B_IXOR_R, B_IROR_R, B_IROL_R, B_ISWAP_R,
+    B_IMULH_R, B_ISMULH_R
 };
 
 struct BInsn {

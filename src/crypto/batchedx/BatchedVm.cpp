@@ -29,6 +29,43 @@ static inline __m512i rolv64(__m512i x, __m512i amt) {
 }
 
 
+// 64x64 -> high 64 across 8 lanes. AVX-512 has no 64-bit high-mul; synthesize from
+// 32x32 partial products (schoolbook), then correct for signedness if needed.
+static inline __m512i mulhi_epu64(__m512i a, __m512i b) {
+    const __m512i lo32 = _mm512_set1_epi64(0xffffffffULL);
+    __m512i al = _mm512_and_si512(a, lo32);
+    __m512i ah = _mm512_srli_epi64(a, 32);
+    __m512i bl = _mm512_and_si512(b, lo32);
+    __m512i bh = _mm512_srli_epi64(b, 32);
+
+    __m512i ll = _mm512_mul_epu32(al, bl);          // al*bl
+    __m512i lh = _mm512_mul_epu32(al, bh);          // al*bh
+    __m512i hl = _mm512_mul_epu32(ah, bl);          // ah*bl
+    __m512i hh = _mm512_mul_epu32(ah, bh);          // ah*bh
+
+    // cross = (ll>>32) + (lh & lo32) + (hl & lo32)
+    __m512i cross = _mm512_add_epi64(_mm512_srli_epi64(ll, 32),
+                    _mm512_add_epi64(_mm512_and_si512(lh, lo32),
+                                     _mm512_and_si512(hl, lo32)));
+    // high = hh + (lh>>32) + (hl>>32) + (cross>>32)
+    __m512i high = _mm512_add_epi64(hh,
+                   _mm512_add_epi64(_mm512_srli_epi64(lh, 32),
+                   _mm512_add_epi64(_mm512_srli_epi64(hl, 32),
+                                    _mm512_srli_epi64(cross, 32))));
+    return high;
+}
+
+// signed high-mul: umulh(a,b) - (a<0 ? b : 0) - (b<0 ? a : 0)
+static inline __m512i mulhi_epi64(__m512i a, __m512i b) {
+    __m512i u = mulhi_epu64(a, b);
+    const __m512i zero = _mm512_setzero_si512();
+    __mmask8 an = _mm512_cmplt_epi64_mask(a, zero);
+    __mmask8 bn = _mm512_cmplt_epi64_mask(b, zero);
+    u = _mm512_mask_sub_epi64(u, an, u, b);
+    u = _mm512_mask_sub_epi64(u, bn, u, a);
+    return u;
+}
+
 // ---- batched integer program execution ---------------------------------------
 
 void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count){
@@ -68,6 +105,8 @@ void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count
       case B_ISWAP_R: // swap dst, src (no-op if same)
         if (in.dst != in.src) { __m512i t = d; d = r[in.src]; r[in.src] = t; }
         break;
+      case B_IMULH_R:  d = mulhi_epu64(d, s); break;
+      case B_ISMULH_R: d = mulhi_epi64(d, s); break;
     }
   }
 
@@ -94,6 +133,8 @@ static void scalarIntegerProgram(uint64_t regs[IREGS], const BInsn* prog, int co
       case B_IROR_R:  d = s_rotr(d, (unsigned)(s & 63)); break;
       case B_IROL_R:  d = s_rotl(d, (unsigned)(s & 63)); break;
       case B_ISWAP_R: if (in.dst != in.src) { uint64_t t = d; d = regs[in.src]; regs[in.src] = t; } break;
+      case B_IMULH_R:  d = (uint64_t)(((unsigned __int128)d * (unsigned __int128)s) >> 64); break;
+      case B_ISMULH_R: d = (uint64_t)(((__int128)(int64_t)d * (__int128)(int64_t)s) >> 64); break;
     }
   }
 }
@@ -117,7 +158,7 @@ int verifyIntegerOps(){
     BInsn prog[PROGLEN];
     for (int i = 0; i < PROGLEN; ++i) {
       uint64_t r = rng();
-      prog[i].op  = (BOp)(r % 8);
+      prog[i].op  = (BOp)(r % 10);
       prog[i].dst   = (r >> 8)  & 7;
       prog[i].src   = (r >> 16) & 7;
       prog[i].shift = (r >> 24) & 3;
