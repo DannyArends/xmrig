@@ -11,6 +11,7 @@
 #include <cstring>
 #include "crypto/randomx/bytecode_machine.hpp"
 #include "crypto/randomx/program.hpp"
+#include "crypto/randomx/aes_hash.hpp"
 
 #if defined(__GNUC__)
 #   pragma GCC target("avx512f,avx512dq")
@@ -726,10 +727,6 @@ static void runProgramIntBranch(uint64_t regs[IREGS][LANES], const BProg& prog)
         if (++steps>maxSteps) break;
         __mmask8 m=0; for (int l=0;l<LANES;++l) if (pc[l]==pos) m|=(1u<<l);
         const BInsn& in = prog.ins[pos];
-        if (prog.ok[pos] && (in.dst >= IREGS || in.src >= IREGS)) {
-            printf("  [dbg] BAD IDX pos=%d op=%d dst=%d src=%d\n", pos, in.op, in.dst, in.src);
-            fflush(stdout);
-        }
         if (prog.ok[pos] && in.op==B_CBRANCH) {
             __m512i& d=r[in.dst];
             d=_mm512_mask_add_epi64(d,m,d,_mm512_set1_epi64((long long)in.imm));
@@ -773,39 +770,31 @@ static void scalarProgramIntBranch(uint64_t regs[IREGS], const BProg& prog)
 int verifyProgram()
 {
     RandomX_CurrentConfig.Apply();
-    printf("  [dbg] enter verifyProgram, ProgramSize=%u\n", (unsigned)RandomX_CurrentConfig.ProgramSize);
-    fflush(stdout);
     printf("== BatchedVm Stage 6a: real-program int/branch verify ==\n");
-    // build a real RandomX cache-free program via random entropy + AES fill is heavy;
-    // instead exercise the translator on random InstructionByteCode by generating
-    // random Instructions and compiling them with the real BytecodeMachine.
     const int PROGRAMS = 2000;
     long fails = 0;
     rng_s = 0xcafef00dd15ea5e5ULL ^ 0x9e3779b97f4a7c15ULL;
     for (int p=0;p<PROGRAMS;++p) {
-        // random Instruction[] (raw opcode bytes) -> compile with real machine
+        // real, valid program: random 64-byte seed -> AES fill (as the VM does)
+        alignas(16) uint8_t seed[64];
+        for (int i=0;i<64;++i) seed[i]=(uint8_t)rng();
         randomx::Program program;
-        uint8_t* raw = reinterpret_cast<uint8_t*>(&program);
-        for (size_t i=0;i<sizeof(randomx::Program);++i) raw[i] = (uint8_t)rng();
+        fillAes4Rx4<false>(seed, 128 + RandomX_CurrentConfig.ProgramSize * 8, &program);
 
         randomx::NativeRegisterFile nreg;
         static randomx::InstructionByteCode bytecode[512];
         randomx::BytecodeMachine bm;
-        if (p == 0) { printf("  [dbg] before compileProgram\n"); fflush(stdout); }
         bm.compileProgram(program, bytecode, nreg);
-        if (p == 0) { printf("  [dbg] after compileProgram\n"); fflush(stdout); }
         
         // translate to BProg (int/branch only; others flagged not-ok = no-op)
         BProg bp; bp.count = (int)RandomX_CurrentConfig.ProgramSize;
         for (int i=0;i<bp.count;++i) bp.ok[i] = translateInt(bytecode[i], nreg, bp.ins[i]);
-        if (p == 0) { printf("  [dbg] after translate\n"); fflush(stdout); }
 
         // run batched (8 lanes) + scalar (8 lanes)
         uint64_t batched[IREGS][LANES], scalar[LANES][IREGS];
         for (int lane=0;lane<LANES;++lane)
             for (int k=0;k<IREGS;++k){uint64_t v=rng();scalar[lane][k]=v;batched[k][lane]=v;}
         runProgramIntBranch(batched, bp);
-        if (p == 0) { printf("  [dbg] after runProgram\n"); fflush(stdout); }
         for (int lane=0;lane<LANES;++lane) scalarProgramIntBranch(scalar[lane], bp);
 
         for (int lane=0;lane<LANES;++lane)
