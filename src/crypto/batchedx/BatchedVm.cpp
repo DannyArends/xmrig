@@ -242,7 +242,7 @@ void runMemoryProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count,
 static inline void applyIntMasked(__m512i r[IREGS], const BInsn& in, __mmask8 m)
 {
     __m512i& d = r[in.dst];
-    const __m512i s = r[in.src];
+    const __m512i s = in.srcImm ? _mm512_set1_epi64((long long)in.srcVal) : r[in.src];
     switch (in.op) {
         case B_IADD_RS: d = _mm512_mask_add_epi64(d, m, d,
                             _mm512_add_epi64(_mm512_slli_epi64(s, in.shift), _mm512_set1_epi64((long long)in.imm))); break;
@@ -689,19 +689,26 @@ static bool translateInt(const randomx::InstructionByteCode& ibc,
 {
     using IT = randomx::InstructionType;
     auto ridx = [&](const uint64_t* p) -> uint8_t { return (uint8_t)(p - &nreg.r[0]); };
+    // source may be a register (isrc in r[0..7]) or an immediate (isrc points elsewhere,
+    // e.g. &ibc.imm for the src==dst / IMUL_RCP forms). Detect and capture accordingly.
+    auto setSrc = [&](const uint64_t* p){
+        long idx = p - &nreg.r[0];
+        if (idx >= 0 && idx < IREGS) { out.srcImm = false; out.src = (uint8_t)idx; out.srcVal = 0; }
+        else                         { out.srcImm = true;  out.src = 0; out.srcVal = *p; }
+    };
     out.imm = ibc.imm; out.memMask = ibc.memMask; out.target = ibc.target;
-    out.shift = (uint8_t)ibc.shift; out.src = 0; out.dst = 0;
+    out.shift = (uint8_t)ibc.shift; out.src = 0; out.dst = 0; out.srcImm = false; out.srcVal = 0;
     switch (ibc.type) {
-        case IT::IADD_RS: out.op=B_IADD_RS; out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
-        case IT::ISUB_R:  out.op=B_ISUB_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
-        case IT::IMUL_R:  out.op=B_IMUL_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::IADD_RS: out.op=B_IADD_RS; out.dst=ridx(ibc.idst); setSrc(ibc.isrc); return true;
+        case IT::ISUB_R:  out.op=B_ISUB_R;  out.dst=ridx(ibc.idst); setSrc(ibc.isrc); return true;
+        case IT::IMUL_R:  out.op=B_IMUL_R;  out.dst=ridx(ibc.idst); setSrc(ibc.isrc); return true;
         case IT::INEG_R:  out.op=B_INEG_R;  out.dst=ridx(ibc.idst); return true;
-        case IT::IXOR_R:  out.op=B_IXOR_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
-        case IT::IROR_R:  out.op=B_IROR_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
-        case IT::IROL_R:  out.op=B_IROL_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
-        case IT::ISWAP_R: out.op=B_ISWAP_R; out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
-        case IT::IMULH_R: out.op=B_IMULH_R; out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
-        case IT::ISMULH_R:out.op=B_ISMULH_R;out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::IXOR_R:  out.op=B_IXOR_R;  out.dst=ridx(ibc.idst); setSrc(ibc.isrc); return true;
+        case IT::IROR_R:  out.op=B_IROR_R;  out.dst=ridx(ibc.idst); setSrc(ibc.isrc); return true;
+        case IT::IROL_R:  out.op=B_IROL_R;  out.dst=ridx(ibc.idst); setSrc(ibc.isrc); return true;
+        case IT::ISWAP_R: out.op=B_ISWAP_R; out.dst=ridx(ibc.idst); setSrc(ibc.isrc); return true;
+        case IT::IMULH_R: out.op=B_IMULH_R; out.dst=ridx(ibc.idst); setSrc(ibc.isrc); return true;
+        case IT::ISMULH_R:out.op=B_ISMULH_R;out.dst=ridx(ibc.idst); setSrc(ibc.isrc); return true;
         case IT::CBRANCH: out.op=B_CBRANCH; out.dst=ridx(ibc.idst); return true;
         default: out.op=B_CBRANCH; return false;   // unsupported here (float/mem); marked skip
     }
@@ -727,11 +734,6 @@ static void runProgramIntBranch(uint64_t regs[IREGS][LANES], const BProg& prog)
         if (++steps>maxSteps) break;
         __mmask8 m=0; for (int l=0;l<LANES;++l) if (pc[l]==pos) m|=(1u<<l);
         const BInsn& in = prog.ins[pos];
-        if (prog.ok[pos] && (in.dst>=IREGS || in.src>=IREGS)) {
-            static int warned=0; if(warned++<3){printf("  [trace] RUNNER bad idx pos=%d op=%d dst=%d src=%d\n",pos,(int)in.op,in.dst,in.src);fflush(stdout);} 
-            for(int l=0;l<LANES;++l) if(pc[l]==pos)++pc[l];
-            continue;
-        }
         if (prog.ok[pos] && in.op==B_CBRANCH) {
             __m512i& d=r[in.dst];
             d=_mm512_mask_add_epi64(d,m,d,_mm512_set1_epi64((long long)in.imm));
@@ -790,33 +792,11 @@ int verifyProgram()
         static randomx::InstructionByteCode bytecode[512];
         randomx::BytecodeMachine bm;
 
-        if (p == 0) {
-            printf("  [trace] ProgramSize=%u  sizeof(NativeRegisterFile)=%zu  r[0]@%p f[0]@%p\n",
-                   (unsigned)RandomX_CurrentConfig.ProgramSize, sizeof(randomx::NativeRegisterFile),
-                   (void*)&nreg.r[0], (void*)&nreg.f[0]);
-            fflush(stdout);
-        }
-
         bm.compileProgram(program, bytecode, nreg);
-        if (p == 0) { printf("  [trace] compiled ok\n"); fflush(stdout); }
 
-        // translate to BProg (int/branch only; others flagged not-ok = no-op)
+        // translate to BProg (int/branch ops; float/mem flagged not-ok = no-op here)
         BProg bp; bp.count = (int)RandomX_CurrentConfig.ProgramSize;
-        int badCount = 0;
-        for (int i=0;i<bp.count;++i) {
-            bp.ok[i] = translateInt(bytecode[i], nreg, bp.ins[i]);
-            const BInsn& bi = bp.ins[i];
-            // detailed trace of first program: type, ok, indices, and range flag
-            bool oor = bp.ok[i] && (bi.dst>=IREGS || bi.src>=IREGS);
-            if (p == 0) {
-                printf("    [%3d] rxtype=%2d ok=%d op=%2d dst=%d src=%d imm=%016llx mm=%08x tgt=%d%s\n",
-                       i, (int)bytecode[i].type, bp.ok[i]?1:0, (int)bi.op, bi.dst, bi.src,
-                       (unsigned long long)bi.imm, bi.memMask, bi.target, oor?"  <== OUT OF RANGE":"");
-                fflush(stdout);
-            }
-            if (oor) { bp.ok[i] = false; ++badCount; }   // neutralize so run won't crash
-        }
-        if (p == 0) { printf("  [trace] translate done, %d out-of-range neutralized\n", badCount); fflush(stdout); }
+        for (int i=0;i<bp.count;++i) bp.ok[i] = translateInt(bytecode[i], nreg, bp.ins[i]);
 
         // run batched (8 lanes) + scalar (8 lanes)
         uint64_t batched[IREGS][LANES], scalar[LANES][IREGS];

@@ -40,6 +40,8 @@ struct BInsn {
     uint64_t imm;     // IADD_RS / memory immediate
     uint32_t memMask; // scratchpad address mask (memory ops) / condition mask (CBRANCH)
     int16_t  target;  // CBRANCH backward-jump target pc
+    bool     srcImm;  // true = source operand is the immediate srcVal (src==dst form)
+    uint64_t srcVal;  // immediate source value when srcImm
 };
 
 /* Run a batched integer-only program. regs[k] holds register k across 8 lanes
