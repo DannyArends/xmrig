@@ -727,6 +727,11 @@ static void runProgramIntBranch(uint64_t regs[IREGS][LANES], const BProg& prog)
         if (++steps>maxSteps) break;
         __mmask8 m=0; for (int l=0;l<LANES;++l) if (pc[l]==pos) m|=(1u<<l);
         const BInsn& in = prog.ins[pos];
+        if (prog.ok[pos] && (in.dst>=IREGS || in.src>=IREGS)) {
+            static int warned=0; if(warned++<3){printf("  [trace] RUNNER bad idx pos=%d op=%d dst=%d src=%d\n",pos,(int)in.op,in.dst,in.src);fflush(stdout);} 
+            for(int l=0;l<LANES;++l) if(pc[l]==pos)++pc[l];
+            continue;
+        }
         if (prog.ok[pos] && in.op==B_CBRANCH) {
             __m512i& d=r[in.dst];
             d=_mm512_mask_add_epi64(d,m,d,_mm512_set1_epi64((long long)in.imm));
@@ -784,11 +789,34 @@ int verifyProgram()
         randomx::NativeRegisterFile nreg;
         static randomx::InstructionByteCode bytecode[512];
         randomx::BytecodeMachine bm;
+
+        if (p == 0) {
+            printf("  [trace] ProgramSize=%u  sizeof(NativeRegisterFile)=%zu  r[0]@%p f[0]@%p\n",
+                   (unsigned)RandomX_CurrentConfig.ProgramSize, sizeof(randomx::NativeRegisterFile),
+                   (void*)&nreg.r[0], (void*)&nreg.f[0]);
+            fflush(stdout);
+        }
+
         bm.compileProgram(program, bytecode, nreg);
-        
+        if (p == 0) { printf("  [trace] compiled ok\n"); fflush(stdout); }
+
         // translate to BProg (int/branch only; others flagged not-ok = no-op)
         BProg bp; bp.count = (int)RandomX_CurrentConfig.ProgramSize;
-        for (int i=0;i<bp.count;++i) bp.ok[i] = translateInt(bytecode[i], nreg, bp.ins[i]);
+        int badCount = 0;
+        for (int i=0;i<bp.count;++i) {
+            bp.ok[i] = translateInt(bytecode[i], nreg, bp.ins[i]);
+            const BInsn& bi = bp.ins[i];
+            // detailed trace of first program: type, ok, indices, and range flag
+            bool oor = bp.ok[i] && (bi.dst>=IREGS || bi.src>=IREGS);
+            if (p == 0) {
+                printf("    [%3d] rxtype=%2d ok=%d op=%2d dst=%d src=%d imm=%016llx mm=%08x tgt=%d%s\n",
+                       i, (int)bytecode[i].type, bp.ok[i]?1:0, (int)bi.op, bi.dst, bi.src,
+                       (unsigned long long)bi.imm, bi.memMask, bi.target, oor?"  <== OUT OF RANGE":"");
+                fflush(stdout);
+            }
+            if (oor) { bp.ok[i] = false; ++badCount; }   // neutralize so run won't crash
+        }
+        if (p == 0) { printf("  [trace] translate done, %d out-of-range neutralized\n", badCount); fflush(stdout); }
 
         // run batched (8 lanes) + scalar (8 lanes)
         uint64_t batched[IREGS][LANES], scalar[LANES][IREGS];
