@@ -107,6 +107,7 @@ void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count
         break;
       case B_IMULH_R:  d = mulhi_epu64(d, s); break;
       case B_ISMULH_R: d = mulhi_epi64(d, s); break;
+      default: break;
     }
   }
 
@@ -135,15 +136,95 @@ static void scalarIntegerProgram(uint64_t regs[IREGS], const BInsn* prog, int co
       case B_ISWAP_R: if (in.dst != in.src) { uint64_t t = d; d = regs[in.src]; regs[in.src] = t; } break;
       case B_IMULH_R:  d = (uint64_t)(((unsigned __int128)d * (unsigned __int128)s) >> 64); break;
       case B_ISMULH_R: d = (uint64_t)(((__int128)(int64_t)d * (__int128)(int64_t)s) >> 64); break;
+      default: break;
     }
   }
 }
 
 
+
+static void scalarMemoryProgram(uint64_t regs[IREGS], const BInsn* prog, int count, uint64_t* sp)
+{
+    for (int i = 0; i < count; ++i) {
+        const BInsn& in = prog[i];
+        uint64_t& d = regs[in.dst];
+        const uint64_t s = regs[in.src];
+        if (in.op == B_ISTORE) {
+            uint32_t addr = (uint32_t)((d + in.imm) & in.memMask);
+            sp[addr >> 3] = s;
+            continue;
+        }
+        uint32_t addr = (uint32_t)((s + in.imm) & in.memMask);
+        uint64_t v = sp[addr >> 3];
+        switch (in.op) {
+            case B_IADD_M:   d += v; break;
+            case B_ISUB_M:   d -= v; break;
+            case B_IMUL_M:   d *= v; break;
+            case B_IMULH_M:  d = (uint64_t)(((unsigned __int128)d * (unsigned __int128)v) >> 64); break;
+            case B_ISMULH_M: d = (uint64_t)(((__int128)(int64_t)d * (__int128)(int64_t)v) >> 64); break;
+            case B_IXOR_M:   d ^= v; break;
+            default: break;
+        }
+    }
+}
+
 // ---- self-test ---------------------------------------------------------------
 
 static uint64_t rng_s;
 static inline uint64_t rng() { rng_s ^= rng_s << 13; rng_s ^= rng_s >> 7; rng_s ^= rng_s << 17; return rng_s; }
+
+
+// ---- Stage 4: batched memory ops (scratchpad gather/scatter) -------------------
+//
+// 8 per-lane scratchpads laid out contiguously: lane L occupies words
+// [L*spWords .. (L+1)*spWords). Load addr per lane = laneBase[L] + wordIndex, where
+// wordIndex = ((src+imm)&memMask)>>3. Loads use vpgatherqq, ISTORE uses vpscatterqq.
+
+void runMemoryProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count,
+                      uint64_t* sp, uint64_t spWords)
+{
+    __m512i r[IREGS];
+    for (int k = 0; k < IREGS; ++k) r[k] = _mm512_loadu_si512((const void*)regs[k]);
+
+    // per-lane base word offset (lane L at L*spWords)
+    const __m512i laneBase = _mm512_set_epi64(
+        (long long)(7*spWords), (long long)(6*spWords), (long long)(5*spWords), (long long)(4*spWords),
+        (long long)(3*spWords), (long long)(2*spWords), (long long)(1*spWords), 0LL);
+
+    for (int i = 0; i < count; ++i) {
+        const BInsn& in = prog[i];
+        __m512i& d = r[in.dst];
+        const __m512i s = r[in.src];
+        const __m512i imm  = _mm512_set1_epi64((long long)in.imm);
+        const __m512i mask = _mm512_set1_epi64((long long)(uint64_t)in.memMask);
+
+        if (in.op == B_ISTORE) {
+            // addr = (dst + imm) & memMask ; store src
+            __m512i addr = _mm512_and_si512(_mm512_add_epi64(d, imm), mask);
+            __m512i widx = _mm512_add_epi64(_mm512_srli_epi64(addr, 3), laneBase);
+            _mm512_i64scatter_epi64((long long*)sp, widx, s, 8);
+            continue;
+        }
+
+        // load ops: addr = (src + imm) & memMask ; v = sp[addr]
+        __m512i addr = _mm512_and_si512(_mm512_add_epi64(s, imm), mask);
+        __m512i widx = _mm512_add_epi64(_mm512_srli_epi64(addr, 3), laneBase);
+        __m512i v    = _mm512_i64gather_epi64(widx, (const long long*)sp, 8);
+
+        switch (in.op) {
+            case B_IADD_M:   d = _mm512_add_epi64(d, v); break;
+            case B_ISUB_M:   d = _mm512_sub_epi64(d, v); break;
+            case B_IMUL_M:   d = _mm512_mullo_epi64(d, v); break;
+            case B_IMULH_M:  d = mulhi_epu64(d, v); break;
+            case B_ISMULH_M: d = mulhi_epi64(d, v); break;
+            case B_IXOR_M:   d = _mm512_xor_si512(d, v); break;
+            default: break;
+        }
+    }
+
+    for (int k = 0; k < IREGS; ++k) _mm512_storeu_si512((void*)regs[k], r[k]);
+}
+
 
 int verifyIntegerOps(){
   printf("== BatchedVm Stage 1: integer ops verify ==\n");
@@ -344,6 +425,77 @@ int verifyFloatOps()
                 if (xb != xs && !bothNaN(xb, xs)) { if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d.hi\n", p, lane, k); ++fails; }
             }
         }
+    }
+
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
+    return fails == 0 ? 0 : 1;
+}
+
+
+
+
+// ---- Stage 4 self-test: memory ops -------------------------------------------
+
+int verifyMemoryOps()
+{
+    printf("== BatchedVm Stage 4: memory ops verify ==\n");
+    rng_s = 0x243f6a8885a308d3ULL ^ 0x9e3779b97f4a7c15ULL;
+
+    const int PROGRAMS = 5000;      // fewer: each carries a scratchpad
+    const int PROGLEN  = 256;
+    // small scratchpad for the test (must be power-of-2 words). 64 KiB = 8192 words.
+    const uint64_t spWords = 8192;
+    const uint32_t spMaskBytes = (uint32_t)(spWords * 8 - 8); // 8-byte aligned mask
+    long fails = 0;
+
+    // batched: one contiguous block of LANES*spWords; scalar: LANES separate arrays
+    static uint64_t spB[LANES * 8192];
+    static uint64_t spS[LANES][8192];
+
+    // memory op set (indices into a small table)
+    static const BOp memops[7] = { B_IADD_M, B_ISUB_M, B_IMUL_M, B_IMULH_M, B_ISMULH_M, B_IXOR_M, B_ISTORE };
+
+    for (int p = 0; p < PROGRAMS; ++p) {
+        // random program of memory ops
+        BInsn prog[PROGLEN];
+        for (int i = 0; i < PROGLEN; ++i) {
+            uint64_t r = rng();
+            prog[i].op      = memops[r % 7];
+            prog[i].dst     = (r >> 8)  & 7;
+            prog[i].src     = (r >> 16) & 7;
+            prog[i].shift   = 0;
+            prog[i].imm     = rng();
+            prog[i].memMask = spMaskBytes;   // fixed mask for the test scratchpad
+        }
+
+        // identical initial registers + scratchpads
+        uint64_t batched[IREGS][LANES];
+        uint64_t scalar [LANES][IREGS];
+        for (int lane = 0; lane < LANES; ++lane) {
+            for (int k = 0; k < IREGS; ++k) { uint64_t v = rng(); scalar[lane][k] = v; batched[k][lane] = v; }
+            for (uint64_t w = 0; w < spWords; ++w) { uint64_t v = rng(); spS[lane][w] = v; spB[lane*spWords + w] = v; }
+        }
+
+        runMemoryProgram(batched, prog, PROGLEN, spB, spWords);
+        for (int lane = 0; lane < LANES; ++lane)
+            scalarMemoryProgram(scalar[lane], prog, PROGLEN, spS[lane]);
+
+        // diff registers
+        for (int lane = 0; lane < LANES; ++lane)
+            for (int k = 0; k < IREGS; ++k)
+                if (batched[k][lane] != scalar[lane][k]) {
+                    if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d: b=%016llx s=%016llx\n",
+                        p, lane, k, (unsigned long long)batched[k][lane], (unsigned long long)scalar[lane][k]);
+                    ++fails;
+                }
+        // diff scratchpads (ISTORE writes)
+        for (int lane = 0; lane < LANES; ++lane)
+            for (uint64_t w = 0; w < spWords; ++w)
+                if (spB[lane*spWords + w] != spS[lane][w]) {
+                    if (fails < 5) printf("  MISMATCH prog %d lane %d sp[%llu]\n", p, lane, (unsigned long long)w);
+                    ++fails;
+                }
     }
 
     printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
