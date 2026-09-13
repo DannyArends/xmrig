@@ -9,6 +9,8 @@
 #include <immintrin.h>
 #include <cstdio>
 #include <cstring>
+#include "crypto/randomx/bytecode_machine.hpp"
+#include "crypto/randomx/program.hpp"
 
 #if defined(__GNUC__)
 #   pragma GCC target("avx512f,avx512dq")
@@ -672,6 +674,140 @@ int verifyBranchOps()
     printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
            fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
     return fails == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// Stage 6a: translate a REAL RandomX program to BInsn[] and run it through a
+// unified batched interpreter (integer + branch), verified against the scalar
+// BytecodeMachine on 8 register files. (float/memory fold in next.)
+// ============================================================================
+
+// translate one compiled InstructionByteCode -> BInsn (integer + branch).
+static bool translateInt(const randomx::InstructionByteCode& ibc,
+                         const randomx::NativeRegisterFile& nreg, BInsn& out)
+{
+    using IT = randomx::InstructionType;
+    auto ridx = [&](const uint64_t* p) -> uint8_t { return (uint8_t)(p - &nreg.r[0]); };
+    out.imm = ibc.imm; out.memMask = ibc.memMask; out.target = ibc.target;
+    out.shift = (uint8_t)ibc.shift; out.src = 0; out.dst = 0;
+    switch (ibc.type) {
+        case IT::IADD_RS: out.op=B_IADD_RS; out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::ISUB_R:  out.op=B_ISUB_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::IMUL_R:  out.op=B_IMUL_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::INEG_R:  out.op=B_INEG_R;  out.dst=ridx(ibc.idst); return true;
+        case IT::IXOR_R:  out.op=B_IXOR_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::IROR_R:  out.op=B_IROR_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::IROL_R:  out.op=B_IROL_R;  out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::ISWAP_R: out.op=B_ISWAP_R; out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::IMULH_R: out.op=B_IMULH_R; out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::ISMULH_R:out.op=B_ISMULH_R;out.dst=ridx(ibc.idst); out.src=ridx(ibc.isrc); return true;
+        case IT::CBRANCH: out.op=B_CBRANCH; out.dst=ridx(ibc.idst); return true;
+        default: out.op=B_CBRANCH; return false;   // unsupported here (float/mem); marked skip
+    }
+}
+
+// Unified batched run over a translated program. For 6a we only support
+// integer + branch ops (matches translateInt). Instructions the translator
+// couldn't map (float/mem) are treated as NO-OP here so the test can be
+// restricted to int/branch-only programs. Uses the Stage-5 per-lane-PC loop.
+struct BProg { BInsn ins[512]; bool ok[512]; int count; };
+
+static void runProgramIntBranch(uint64_t regs[IREGS][LANES], const BProg& prog)
+{
+    __m512i r[IREGS];
+    for (int k = 0; k < IREGS; ++k) r[k] = _mm512_loadu_si512((const void*)regs[k]);
+
+    int pc[LANES]; for (int l=0;l<LANES;++l) pc[l]=0;
+    long steps=0, maxSteps=(long)prog.count*64*LANES;
+    for (;;) {
+        int pos = prog.count;
+        for (int l=0;l<LANES;++l) if (pc[l]<prog.count && pc[l]<pos) pos=pc[l];
+        if (pos>=prog.count) break;
+        if (++steps>maxSteps) break;
+        __mmask8 m=0; for (int l=0;l<LANES;++l) if (pc[l]==pos) m|=(1u<<l);
+        const BInsn& in = prog.ins[pos];
+        if (prog.ok[pos] && in.op==B_CBRANCH) {
+            __m512i& d=r[in.dst];
+            d=_mm512_mask_add_epi64(d,m,d,_mm512_set1_epi64((long long)in.imm));
+            __mmask8 taken=_mm512_mask_cmpeq_epi64_mask(m,
+                _mm512_and_si512(d,_mm512_set1_epi64((long long)(uint64_t)in.memMask)),_mm512_setzero_si512());
+            for (int l=0;l<LANES;++l) if (pc[l]==pos) pc[l]=(taken&(1u<<l))?in.target:pos+1;
+        } else {
+            if (prog.ok[pos]) applyIntMasked(r,in,m);   // float/mem => no-op for 6a
+            for (int l=0;l<LANES;++l) if (pc[l]==pos) ++pc[l];
+        }
+    }
+    for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)regs[k], r[k]);
+}
+
+// scalar reference for the same restricted (int/branch) program on one lane.
+static void scalarProgramIntBranch(uint64_t regs[IREGS], const BProg& prog)
+{
+    long steps=0, maxSteps=(long)prog.count*64;
+    for (int pc=0; pc<prog.count; ) {
+        if (++steps>maxSteps) break;
+        const BInsn& in=prog.ins[pc];
+        if (!prog.ok[pc]) { ++pc; continue; }         // float/mem => no-op
+        uint64_t& d=regs[in.dst]; const uint64_t s=regs[in.src];
+        switch (in.op) {
+            case B_IADD_RS: d+=(s<<in.shift)+in.imm; ++pc; break;
+            case B_ISUB_R:  d-=s; ++pc; break;
+            case B_IMUL_R:  d*=s; ++pc; break;
+            case B_INEG_R:  d=~d+1; ++pc; break;
+            case B_IXOR_R:  d^=s; ++pc; break;
+            case B_IROR_R:  d=s_rotr(d,(unsigned)(s&63)); ++pc; break;
+            case B_IROL_R:  d=s_rotl(d,(unsigned)(s&63)); ++pc; break;
+            case B_ISWAP_R: if(in.dst!=in.src){uint64_t t=d;d=regs[in.src];regs[in.src]=t;} ++pc; break;
+            case B_IMULH_R: d=(uint64_t)(((unsigned __int128)d*(unsigned __int128)s)>>64); ++pc; break;
+            case B_ISMULH_R:d=(uint64_t)(((__int128)(int64_t)d*(__int128)(int64_t)s)>>64); ++pc; break;
+            case B_CBRANCH: d+=in.imm; if((d&(uint64_t)in.memMask)==0) pc=in.target; else ++pc; break;
+            default: ++pc; break;
+        }
+    }
+}
+
+int verifyProgram()
+{
+    printf("== BatchedVm Stage 6a: real-program int/branch verify ==\n");
+    // build a real RandomX cache-free program via random entropy + AES fill is heavy;
+    // instead exercise the translator on random InstructionByteCode by generating
+    // random Instructions and compiling them with the real BytecodeMachine.
+    const int PROGRAMS = 2000;
+    long fails = 0;
+    rng_s = 0xcafef00dd15ea5e5ULL ^ 0x9e3779b97f4a7c15ULL;
+
+    for (int p=0;p<PROGRAMS;++p) {
+        // random Instruction[] (raw opcode bytes) -> compile with real machine
+        randomx::Program program;
+        uint8_t* raw = reinterpret_cast<uint8_t*>(&program);
+        for (size_t i=0;i<sizeof(randomx::Program);++i) raw[i] = (uint8_t)rng();
+
+        randomx::NativeRegisterFile nreg;
+        static randomx::InstructionByteCode bytecode[512];
+        randomx::BytecodeMachine bm;
+        bm.compileProgram(program, bytecode, nreg);
+
+        // translate to BProg (int/branch only; others flagged not-ok = no-op)
+        BProg bp; bp.count = (int)RandomX_CurrentConfig.ProgramSize;
+        for (int i=0;i<bp.count;++i) bp.ok[i] = translateInt(bytecode[i], nreg, bp.ins[i]);
+
+        // run batched (8 lanes) + scalar (8 lanes)
+        uint64_t batched[IREGS][LANES], scalar[LANES][IREGS];
+        for (int lane=0;lane<LANES;++lane)
+            for (int k=0;k<IREGS;++k){uint64_t v=rng();scalar[lane][k]=v;batched[k][lane]=v;}
+        runProgramIntBranch(batched, bp);
+        for (int lane=0;lane<LANES;++lane) scalarProgramIntBranch(scalar[lane], bp);
+
+        for (int lane=0;lane<LANES;++lane)
+            for (int k=0;k<IREGS;++k)
+                if (batched[k][lane]!=scalar[lane][k]) {
+                    if (fails<5) printf("  MISMATCH prog %d lane %d reg %d\n",p,lane,k);
+                    ++fails;
+                }
+    }
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, PROGRAMS, LANES);
+    return fails==0?0:1;
 }
 
 

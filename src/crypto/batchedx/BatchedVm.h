@@ -59,6 +59,9 @@ int verifyMemoryOps();
 /* Stage 5: CBRANCH (per-lane PC + masked execution) self-test. Returns 0 on all-pass. */
 int verifyBranchOps();
 
+/* Stage 6a: real-program (int/branch) verify. Returns 0 on all-pass. */
+int verifyProgram();
+
 } // namespace batchedx
 
 
