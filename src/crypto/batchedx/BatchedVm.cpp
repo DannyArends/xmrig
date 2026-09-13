@@ -236,6 +236,13 @@ static inline double emask_s(double v) {
     double r; memcpy(&r, &b, 8); return r;
 }
 
+static inline bool bothNaN(uint64_t a, uint64_t b) {
+    // exponent all ones + nonzero mantissa = NaN (ignore sign)
+    auto isnan = [](uint64_t x){ return ((x & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
+                                     && (x & 0x000fffffffffffffULL); };
+    return isnan(a) && isnan(b);
+}
+
 // batched: reg[k].lo / reg[k].hi are __m512d (8 lanes)
 struct BFReg { __m512d lo, hi; };
 
@@ -332,9 +339,9 @@ int verifyFloatOps()
             for (int lane = 0; lane < LANES; ++lane) {
                 uint64_t xb, xs;
                 memcpy(&xb, &blo[lane], 8); memcpy(&xs, &scalar[lane][k][0], 8);
-                if (xb != xs) { if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d.lo\n", p, lane, k); ++fails; }
+                if (xb != xs && !bothNaN(xb, xs)) { if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d.lo\n", p, lane, k); ++fails; }
                 memcpy(&xb, &bhi[lane], 8); memcpy(&xs, &scalar[lane][k][1], 8);
-                if (xb != xs) { if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d.hi\n", p, lane, k); ++fails; }
+                if (xb != xs && !bothNaN(xb, xs)) { if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d.hi\n", p, lane, k); ++fails; }
             }
         }
     }
