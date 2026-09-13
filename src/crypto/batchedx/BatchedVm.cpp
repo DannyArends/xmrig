@@ -230,6 +230,12 @@ static inline __m512d emask(__m512d v) {
     return _mm512_castsi512_pd(b);
 }
 
+static inline double emask_s(double v) {
+    uint64_t b; memcpy(&b, &v, 8);
+    b = (b & E_MANTISSA_MASK) | E_EXP_MASK;
+    double r; memcpy(&r, &b, 8); return r;
+}
+
 // batched: reg[k].lo / reg[k].hi are __m512d (8 lanes)
 struct BFReg { __m512d lo, hi; };
 
@@ -267,7 +273,7 @@ static void scalarFloatProgram(double reg[FREGS][2], const FInsn* prog, int coun
             case F_FADD_R:  d[0] += s[0]; d[1] += s[1]; break;
             case F_FSUB_R:  d[0] -= s[0]; d[1] -= s[1]; break;
             case F_FMUL_R:  d[0] *= s[0]; d[1] *= s[1]; break;
-            case F_FSQRT_R: d[0] = __builtin_sqrt(d[0]); d[1] = __builtin_sqrt(d[1]); break;
+            case F_FSQRT_R: d[0] = __builtin_sqrt(emask_s(d[0])); d[1] = __builtin_sqrt(emask_s(d[1])); break;
             case F_FSCAL_R: {
                 uint64_t b0, b1; memcpy(&b0, &d[0], 8); memcpy(&b1, &d[1], 8);
                 b0 ^= FSCAL_MASK; b1 ^= FSCAL_MASK;
