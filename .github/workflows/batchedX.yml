@@ -20,10 +20,14 @@ jobs:
 
       - name: Install Intel SDE
         run: |
-          SDE_VER=sde-external-9.33.0-2024-01-07-lin
-          wget -q https://downloadmirror.intel.com/software-kit/792150/${SDE_VER}.tar.xz
-          tar -xf ${SDE_VER}.tar.xz
-          echo "$PWD/${SDE_VER}" >> "$GITHUB_PATH"
+          set -euo pipefail
+          SDE_URL=$(curl -sL https://www.intel.com/content/www/us/en/download/684897/intel-software-development-emulator.html \
+                    | grep -Po 'https://downloadmirror\.intel\.com/[^"]*lin\.tar\.xz' | head -1)
+          echo "SDE URL: $SDE_URL"
+          test -n "$SDE_URL"
+          wget -qO sde.tar.xz "$SDE_URL"
+          mkdir sde && tar -xf sde.tar.xz -C sde --strip-components=1
+          echo "$PWD/sde" >> "$GITHUB_PATH"
 
       - name: Set ccache dir
         run: echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
