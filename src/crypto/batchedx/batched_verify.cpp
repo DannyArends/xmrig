@@ -25,10 +25,14 @@ static Stage8Ctx stage8_setup()
     static RxDataset dataset(false, false, true, RxConfig::FastMode, 0);
     static bool inited = false;
     Stage8Ctx c{ nullptr, nullptr };
+    fprintf(stderr, "[8] ctor: dataset=%p cache=%p\n", (void*)dataset.get(), (void*)dataset.cache());
     if (!dataset.get()) { printf("  8: dataset alloc failed (FastMode needs ~2GiB)\n"); return c; }
-    if (!inited) { printf("  8: initialising FastMode dataset (may take a while)...\n"); dataset.init(seed, 1, 0); inited = true; }
+    if (!inited) { fprintf(stderr, "[8] init dataset...\n"); bool ok = dataset.init(seed, 1, 0); fprintf(stderr, "[8] init=%d\n", ok); inited = true; }
+    fprintf(stderr, "[8] create vm...\n");
     c.vm = RxVm::create(&dataset, nullptr, true, Assembly(), 0);
+    fprintf(stderr, "[8] vm=%p\n", (void*)c.vm);
     c.ds = (const uint64_t*)randomx_get_dataset_memory(dataset.get());
+    fprintf(stderr, "[8] ds=%p\n", (void*)c.ds);
     return c;
 }
 static void stage8_teardown(randomx_vm* vm) { if (vm) RxVm::destroy(vm); }
