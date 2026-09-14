@@ -99,6 +99,7 @@ void runFloatProgram(BFReg reg[FREGS], const FInsn* prog, int count);
 void runProgramIntBranch(uint64_t regs[IREGS][LANES], const BProg& prog);
 void runProgramFull(uint64_t rIn[IREGS][LANES], BFReg F[8], const BFReg A[4], uint64_t* sp, uint64_t spWords, const uint64_t eMask[2], const FullProg& prog);
 void runBytecodeVecPerLane(__m512i r[IREGS], BFReg F[8], const BFReg A[4], uint64_t* sp, uint64_t spWords, __m512d eMaskLo, __m512d eMaskHi, const FullProg* prog, int rmode[LANES]);
+void runBatchedExecutePerLane(__m512i r[IREGS], BFReg F[8], const BFReg A[4], uint64_t* sp, uint64_t spWords, __m512d eMaskLo, __m512d eMaskHi, const FullProg* prog, __m512i& ma, __m512i& mx, __m512i rr0, __m512i rr1, __m512i rr2, __m512i rr3, __m512i datasetOffset, const uint64_t* dataset, uint64_t dmask, uint32_t iterations, int rmode[LANES]);
 void runBatchedExecute(__m512i r[IREGS], BFReg F[8], const BFReg A[4], uint64_t* sp, uint64_t spWords, const uint64_t eMask[2], const FullProg& prog, __m512i& ma, __m512i& mx, int rr0, int rr1, int rr2, int rr3, uint64_t datasetOffset, const uint64_t* dataset, uint64_t dmask, uint32_t iterations, int rmode[LANES]);
 void scalarIntegerProgram(uint64_t regs[IREGS], const BInsn* prog, int count);
 void scalarMemoryProgram(uint64_t regs[IREGS], const BInsn* prog, int count, uint64_t* sp);

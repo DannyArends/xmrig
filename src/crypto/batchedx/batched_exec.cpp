@@ -628,6 +628,87 @@ void runBytecodeVecPerLane(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
     }
 }
 
+
+// increment 5b: per-lane VM loop (mirror of runBatchedExecute, per-lane programs+config).
+void runBatchedExecutePerLane(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
+                              uint64_t* sp, uint64_t spWords,
+                              __m512d eMaskLo, __m512d eMaskHi, const FullProg* prog,
+                              __m512i& ma, __m512i& mx,
+                              __m512i rr0, __m512i rr1, __m512i rr2, __m512i rr3,
+                              __m512i datasetOffset, const uint64_t* dataset, uint64_t dmask,
+                              uint32_t iterations, int rmode[LANES])
+{
+    const __m512i laneBase = _mm512_set_epi64(
+        (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
+        (long long)(3*spWords),(long long)(2*spWords),(long long)(1*spWords),0LL);
+    const __m512d mantMask = _mm512_castsi512_pd(_mm512_set1_epi64((long long)E_MANTISSA_MASK));
+    const __m512i sp3mask  = _mm512_set1_epi64((long long)(uint32_t)ScratchpadL3Mask64);
+    const __m512i clmask   = _mm512_set1_epi64((long long)(uint64_t)CacheLineAlignMask);
+    const __m512i dmaskv   = _mm512_set1_epi64((long long)dmask);
+    const __m512i lo32     = _mm512_set1_epi64(0xFFFFFFFFll);
+    const bool prefetchTweak = RandomX_CurrentConfig.Tweak_V2_PREFETCH;
+
+    __m512i spAddr0 = mx;
+    __m512i spAddr1 = ma;
+
+    for(uint32_t ic=0; ic<iterations; ++ic){
+        __m512i spMix = _mm512_xor_si512(selectReg(r,rr0), selectReg(r,rr1));
+        spAddr0 = _mm512_and_si512(_mm512_xor_si512(spAddr0, spMix), sp3mask);
+        spAddr1 = _mm512_and_si512(_mm512_xor_si512(spAddr1, _mm512_srli_epi64(spMix,32)), sp3mask);
+
+        const __m512i w0 = _mm512_add_epi64(laneBase, _mm512_srli_epi64(spAddr0,3));
+        const __m512i w1 = _mm512_add_epi64(laneBase, _mm512_srli_epi64(spAddr1,3));
+
+        for(int i=0;i<IREGS;++i){
+            __m512i idx=_mm512_add_epi64(w0,_mm512_set1_epi64(i));
+            r[i]=_mm512_xor_si512(r[i], _mm512_i64gather_epi64(idx,(const long long*)sp,8));
+        }
+        for(int i=0;i<randomx::RegisterCountFlt;++i){
+            __m512i idx=_mm512_add_epi64(w1,_mm512_set1_epi64(i));
+            __m512i wq=_mm512_i64gather_epi64(idx,(const long long*)sp,8);
+            cvtPackedIntPD(wq, F[i].lo, F[i].hi);
+        }
+        for(int i=0;i<randomx::RegisterCountFlt;++i){
+            __m512i idx=_mm512_add_epi64(w1,_mm512_set1_epi64(randomx::RegisterCountFlt+i));
+            __m512i wq=_mm512_i64gather_epi64(idx,(const long long*)sp,8);
+            __m512d elo,ehi; cvtPackedIntPD(wq,elo,ehi);
+            F[randomx::RegisterCountFlt+i].lo=_mm512_or_pd(_mm512_and_pd(elo,mantMask),eMaskLo);
+            F[randomx::RegisterCountFlt+i].hi=_mm512_or_pd(_mm512_and_pd(ehi,mantMask),eMaskHi);
+        }
+
+        runBytecodeVecPerLane(r, F, A, sp, spWords, eMaskLo, eMaskHi, prog, rmode);
+
+        __m512i readPtr=_mm512_add_epi64(datasetOffset, _mm512_and_si512(ma, clmask));
+        __m512i mpx=_mm512_and_si512(_mm512_xor_si512(selectReg(r,rr2), selectReg(r,rr3)), lo32);
+        if(prefetchTweak) ma=_mm512_and_si512(_mm512_xor_si512(ma,mpx), lo32);
+        else              mx=_mm512_and_si512(_mm512_xor_si512(mx,mpx), lo32);
+
+        __m512i dw=_mm512_srli_epi64(readPtr,3);
+        for(int i=0;i<IREGS;++i){
+            __m512i idx=_mm512_and_si512(_mm512_add_epi64(dw,_mm512_set1_epi64(i)), dmaskv);
+            r[i]=_mm512_xor_si512(r[i], _mm512_i64gather_epi64(idx,(const long long*)dataset,8));
+        }
+
+        { __m512i t=mx; mx=ma; ma=t; }
+
+        for(int i=0;i<IREGS;++i){
+            __m512i idx=_mm512_add_epi64(w1,_mm512_set1_epi64(i));
+            _mm512_i64scatter_epi64((long long*)sp, idx, r[i], 8);
+        }
+        for(int i=0;i<randomx::RegisterCountFlt;++i){
+            F[i].lo=_mm512_xor_pd(F[i].lo,F[randomx::RegisterCountFlt+i].lo);
+            F[i].hi=_mm512_xor_pd(F[i].hi,F[randomx::RegisterCountFlt+i].hi);
+            _mm512_i64scatter_epi64((long long*)sp, _mm512_add_epi64(w0,_mm512_set1_epi64(2*i)),
+                                    _mm512_castpd_si512(F[i].lo), 8);
+            _mm512_i64scatter_epi64((long long*)sp, _mm512_add_epi64(w0,_mm512_set1_epi64(2*i+1)),
+                                    _mm512_castpd_si512(F[i].hi), 8);
+        }
+
+        spAddr0=_mm512_setzero_si512();
+        spAddr1=_mm512_setzero_si512();
+    }
+}
+
 #if defined(__GNUC__)
 #   pragma GCC pop_options
 #endif
