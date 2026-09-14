@@ -763,5 +763,333 @@ int verifyProgram()
 }
 
 
+
+// ============================================================================
+// Stage 6b: full unified interpreter over REAL programs (int + branch + memory
+// + float), verified against RandomX's own executeBytecode per lane.
+// ============================================================================
+
+// Extend translateInt-style mapping for memory-integer ops. Returns true if mapped.
+static bool translateMemInt(const randomx::InstructionByteCode& ibc,
+                            const randomx::NativeRegisterFile& nreg, BInsn& out)
+{
+    using IT = randomx::InstructionType;
+    auto ridxR = [&](const uint64_t* p)->int { long i = p - &nreg.r[0]; return (i>=0 && i<IREGS)?(int)i:-1; };
+    out.imm = ibc.imm; out.memMask = ibc.memMask; out.shift=0; out.target=0;
+    out.srcImm=false; out.srcVal=0; out.dst=0; out.src=0;
+    int addr = ridxR(ibc.isrc);            // address register; -1 if &zero (src==dst)
+    bool addrZero = (addr < 0);
+    out.src = addrZero ? 0 : (uint8_t)addr;      // if zero-src, addr uses reg 0 masked out below
+    out.srcImm = addrZero;                        // reuse srcImm to mean "address reg is zero"
+    switch (ibc.type) {
+        case IT::IADD_M:  out.op=B_IADD_M;  out.dst=(uint8_t)(ibc.idst-&nreg.r[0]); return true;
+        case IT::ISUB_M:  out.op=B_ISUB_M;  out.dst=(uint8_t)(ibc.idst-&nreg.r[0]); return true;
+        case IT::IMUL_M:  out.op=B_IMUL_M;  out.dst=(uint8_t)(ibc.idst-&nreg.r[0]); return true;
+        case IT::IMULH_M: out.op=B_IMULH_M; out.dst=(uint8_t)(ibc.idst-&nreg.r[0]); return true;
+        case IT::ISMULH_M:out.op=B_ISMULH_M;out.dst=(uint8_t)(ibc.idst-&nreg.r[0]); return true;
+        case IT::IXOR_M:  out.op=B_IXOR_M;  out.dst=(uint8_t)(ibc.idst-&nreg.r[0]); return true;
+        case IT::ISTORE:  out.op=B_ISTORE;
+                          out.dst=(uint8_t)(ibc.idst-&nreg.r[0]);
+                          out.src=(uint8_t)(ibc.isrc-&nreg.r[0]);  // ISTORE src is always a reg
+                          out.srcImm=false;
+                          return true;
+        default: return false;
+    }
+}
+
+// Float op codes for the unified interpreter.
+enum FBOp : uint8_t { FB_NONE, FB_FSWAP, FB_FADD_R, FB_FSUB_R, FB_FMUL_R, FB_FSQRT_R,
+                      FB_FSCAL_R, FB_FADD_M, FB_FSUB_M, FB_FDIV_M };
+
+struct FullInsn {
+    uint8_t kind;   // 0=int/branch(ib), 1=float(fop), 2=skip
+    BInsn   ib;
+    FBOp    fop;
+    uint8_t fdst;   // 0..7 (f=0..3, e=4..7)
+    uint8_t fsrc;   // a-group 0..3
+    uint8_t maddr;  // r-reg for float-M address
+    uint64_t fimm;
+    uint32_t fmask;
+};
+
+static void translateFull(const randomx::InstructionByteCode& ibc,
+                          const randomx::NativeRegisterFile& nreg, FullInsn& out)
+{
+    using IT = randomx::InstructionType;
+    auto fidx = [&](const void* p)->int {
+        const rx_vec_f128* fp = reinterpret_cast<const rx_vec_f128*>(p);
+        long f = fp-&nreg.f[0]; if (f>=0&&f<randomx::RegisterCountFlt) return (int)f;
+        long e = fp-&nreg.e[0]; if (e>=0&&e<randomx::RegisterCountFlt) return (int)e+randomx::RegisterCountFlt;
+        return 0;
+    };
+    auto aidx = [&](const void* p)->int {
+        const rx_vec_f128* fp = reinterpret_cast<const rx_vec_f128*>(p);
+        long a = fp-&nreg.a[0]; return (a>=0&&a<randomx::RegisterCountFlt)?(int)a:0;
+    };
+    out.fimm = ibc.imm; out.fmask = ibc.memMask;
+    switch (ibc.type) {
+        case IT::FSWAP_R: out.kind=1; out.fop=FB_FSWAP;  out.fdst=(uint8_t)fidx(ibc.fdst); return;
+        case IT::FADD_R:  out.kind=1; out.fop=FB_FADD_R; out.fdst=(uint8_t)fidx(ibc.fdst); out.fsrc=(uint8_t)aidx(ibc.fsrc); return;
+        case IT::FSUB_R:  out.kind=1; out.fop=FB_FSUB_R; out.fdst=(uint8_t)fidx(ibc.fdst); out.fsrc=(uint8_t)aidx(ibc.fsrc); return;
+        case IT::FMUL_R:  out.kind=1; out.fop=FB_FMUL_R; out.fdst=(uint8_t)fidx(ibc.fdst); out.fsrc=(uint8_t)aidx(ibc.fsrc); return;
+        case IT::FSQRT_R: out.kind=1; out.fop=FB_FSQRT_R;out.fdst=(uint8_t)fidx(ibc.fdst); return;
+        case IT::FSCAL_R: out.kind=1; out.fop=FB_FSCAL_R;out.fdst=(uint8_t)fidx(ibc.fdst); return;
+        case IT::FADD_M:  out.kind=1; out.fop=FB_FADD_M; out.fdst=(uint8_t)fidx(ibc.fdst); out.maddr=(uint8_t)(ibc.isrc-&nreg.r[0]); return;
+        case IT::FSUB_M:  out.kind=1; out.fop=FB_FSUB_M; out.fdst=(uint8_t)fidx(ibc.fdst); out.maddr=(uint8_t)(ibc.isrc-&nreg.r[0]); return;
+        case IT::FDIV_M:  out.kind=1; out.fop=FB_FDIV_M; out.fdst=(uint8_t)fidx(ibc.fdst); out.maddr=(uint8_t)(ibc.isrc-&nreg.r[0]); return;
+        case IT::CFROUND: out.kind=2; return;
+        case IT::NOP:     out.kind=2; return;
+        default:
+            if (translateInt(ibc, nreg, out.ib)) { out.kind=0; return; }
+            if (translateMemInt(ibc, nreg, out.ib)) { out.kind=0; return; }
+            out.kind=2; return;
+    }
+}
+
+// Full batched interpreter over a translated real program. State:
+//   r[8]  integer regs (per lane in __m512i)
+//   F[8]  float regs f(0..3)/e(4..7) as BFReg lo/hi
+//   A[4]  read-only a-group float regs (BFReg)
+//   sp    per-lane scratchpad (contiguous LANES*spWords)
+// Per-lane PC loop (handles CBRANCH divergence). Memory addr per lane via gather.
+struct FullProg { FullInsn ins[512]; int count; };
+
+// convert 2x int32 from scratchpad word -> 2 doubles (rx_cvt_packed_int_vec_f128),
+// gathered per lane. word at 64-bit granularity: low 2 int32 of the 8-byte word.
+static inline void cvtPackedIntPD(__m512i words, __m512d& lo, __m512d& hi) {
+    // low int32 of each lane's 64-bit word -> lo double; high int32 -> hi double
+    __m512i loI = _mm512_and_si512(words, _mm512_set1_epi64(0xffffffffULL));
+    __m512i hiI = _mm512_srli_epi64(words, 32);
+    // sign-extend 32->64 then convert
+    loI = _mm512_srai_epi64(_mm512_slli_epi64(loI,32),32);
+    hiI = _mm512_srai_epi64(_mm512_slli_epi64(hiI,32),32);
+    lo = _mm512_cvtepi64_pd(loI);
+    hi = _mm512_cvtepi64_pd(hiI);
+}
+
+static void runProgramFull(uint64_t rIn[IREGS][LANES],
+                           BFReg F[8], const BFReg A[4],
+                           uint64_t* sp, uint64_t spWords,
+                           const uint64_t eMask[2],
+                           const FullProg& prog)
+{
+    __m512i r[IREGS];
+    for (int k=0;k<IREGS;++k) r[k]=_mm512_loadu_si512((const void*)rIn[k]);
+
+    const __m512i laneBase = _mm512_set_epi64(
+        (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
+        (long long)(3*spWords),(long long)(2*spWords),(long long)(1*spWords),0LL);
+    // E-mask as doubles (per element0/1)
+    const __m512d eMaskLo = _mm512_castsi512_pd(_mm512_set1_epi64((long long)eMask[0]));
+    const __m512d eMaskHi = _mm512_castsi512_pd(_mm512_set1_epi64((long long)eMask[1]));
+    const __m512d mantMask = _mm512_castsi512_pd(_mm512_set1_epi64((long long)((1ULL<<52)-1)));
+
+    int pc[LANES]; for(int l=0;l<LANES;++l) pc[l]=0;
+    long steps=0, maxSteps=(long)prog.count*64*LANES;
+    for(;;){
+        int pos=prog.count;
+        for(int l=0;l<LANES;++l) if(pc[l]<prog.count && pc[l]<pos) pos=pc[l];
+        if(pos>=prog.count) break;
+        if(++steps>maxSteps) break;
+        __mmask8 m=0; for(int l=0;l<LANES;++l) if(pc[l]==pos) m|=(1u<<l);
+        const FullInsn& fi = prog.ins[pos];
+
+        if (fi.kind==2) { for(int l=0;l<LANES;++l) if(pc[l]==pos)++pc[l]; continue; }
+
+        if (fi.kind==0) {
+            const BInsn& in = fi.ib;
+            if (in.op==B_CBRANCH) {
+                __m512i& d=r[in.dst];
+                d=_mm512_mask_add_epi64(d,m,d,_mm512_set1_epi64((long long)in.imm));
+                __mmask8 taken=_mm512_mask_cmpeq_epi64_mask(m,
+                    _mm512_and_si512(d,_mm512_set1_epi64((long long)(uint64_t)in.memMask)),_mm512_setzero_si512());
+                for(int l=0;l<LANES;++l) if(pc[l]==pos) pc[l]=(taken&(1u<<l))?(in.target+1):pos+1;
+                continue;
+            }
+            // integer register / memory ops
+            switch (in.op) {
+                case B_IADD_RS: case B_ISUB_R: case B_IMUL_R: case B_INEG_R:
+                case B_IXOR_R:  case B_IROR_R: case B_IROL_R: case B_ISWAP_R:
+                case B_IMULH_R: case B_ISMULH_R:
+                    applyIntMasked(r,in,m); break;
+                case B_IADD_M: case B_ISUB_M: case B_IMUL_M: case B_IMULH_M:
+                case B_ISMULH_M: case B_IXOR_M: {
+                    // addr reg value (0 if srcImm meaning zero-src)
+                    __m512i sreg = in.srcImm ? _mm512_setzero_si512() : r[in.src];
+                    __m512i addr=_mm512_and_si512(_mm512_add_epi64(sreg,_mm512_set1_epi64((long long)in.imm)),
+                                                  _mm512_set1_epi64((long long)(uint64_t)in.memMask));
+                    __m512i widx=_mm512_add_epi64(_mm512_srli_epi64(addr,3),laneBase);
+                    __m512i v=_mm512_i64gather_epi64(widx,(const long long*)sp,8);
+                    __m512i& d=r[in.dst];
+                    switch(in.op){
+                        case B_IADD_M:  d=_mm512_mask_add_epi64(d,m,d,v); break;
+                        case B_ISUB_M:  d=_mm512_mask_sub_epi64(d,m,d,v); break;
+                        case B_IMUL_M:  d=_mm512_mask_mullo_epi64(d,m,d,v); break;
+                        case B_IMULH_M: d=_mm512_mask_blend_epi64(m,d,mulhi_epu64(d,v)); break;
+                        case B_ISMULH_M:d=_mm512_mask_blend_epi64(m,d,mulhi_epi64(d,v)); break;
+                        case B_IXOR_M:  d=_mm512_mask_xor_epi64(d,m,d,v); break;
+                        default: break;
+                    }
+                    break;
+                }
+                case B_ISTORE: {
+                    __m512i addr=_mm512_and_si512(_mm512_add_epi64(r[in.dst],_mm512_set1_epi64((long long)in.imm)),
+                                                  _mm512_set1_epi64((long long)(uint64_t)in.memMask));
+                    __m512i widx=_mm512_add_epi64(_mm512_srli_epi64(addr,3),laneBase);
+                    // masked scatter: only active lanes
+                    _mm512_mask_i64scatter_epi64((long long*)sp,m,widx,r[in.src],8);
+                    break;
+                }
+                default: break;
+            }
+            for(int l=0;l<LANES;++l) if(pc[l]==pos)++pc[l];
+            continue;
+        }
+
+        // kind==1 : float op
+        {
+            BFReg& d = F[fi.fdst];
+            switch (fi.fop) {
+                case FB_FSWAP: {
+                    __m512d tl=_mm512_mask_blend_pd(m,d.lo,d.hi);
+                    __m512d th=_mm512_mask_blend_pd(m,d.hi,d.lo);
+                    d.lo=tl; d.hi=th; break;
+                }
+                case FB_FADD_R: { const BFReg& s=A[fi.fsrc];
+                    d.lo=_mm512_mask_add_pd(d.lo,m,d.lo,s.lo); d.hi=_mm512_mask_add_pd(d.hi,m,d.hi,s.hi); break; }
+                case FB_FSUB_R: { const BFReg& s=A[fi.fsrc];
+                    d.lo=_mm512_mask_sub_pd(d.lo,m,d.lo,s.lo); d.hi=_mm512_mask_sub_pd(d.hi,m,d.hi,s.hi); break; }
+                case FB_FMUL_R: { const BFReg& s=A[fi.fsrc];
+                    d.lo=_mm512_mask_mul_pd(d.lo,m,d.lo,s.lo); d.hi=_mm512_mask_mul_pd(d.hi,m,d.hi,s.hi); break; }
+                case FB_FSQRT_R:
+                    d.lo=_mm512_mask_sqrt_pd(d.lo,m,d.lo); d.hi=_mm512_mask_sqrt_pd(d.hi,m,d.hi); break;
+                case FB_FSCAL_R:
+                    d.lo=_mm512_mask_blend_pd(m,d.lo,fscal(d.lo)); d.hi=_mm512_mask_blend_pd(m,d.hi,fscal(d.hi)); break;
+                case FB_FADD_M: case FB_FSUB_M: case FB_FDIV_M: {
+                    __m512i addr=_mm512_and_si512(_mm512_add_epi64(r[fi.maddr],_mm512_set1_epi64((long long)fi.fimm)),
+                                                  _mm512_set1_epi64((long long)(uint64_t)fi.fmask));
+                    __m512i widx=_mm512_add_epi64(_mm512_srli_epi64(addr,3),laneBase);
+                    __m512i w=_mm512_i64gather_epi64(widx,(const long long*)sp,8);
+                    __m512d slo,shi; cvtPackedIntPD(w,slo,shi);
+                    if (fi.fop==FB_FDIV_M) {
+                        // maskRegisterExponentMantissa: (x & mant) | eMask
+                        slo=_mm512_or_pd(_mm512_and_pd(slo,mantMask),eMaskLo);
+                        shi=_mm512_or_pd(_mm512_and_pd(shi,mantMask),eMaskHi);
+                        d.lo=_mm512_mask_div_pd(d.lo,m,d.lo,slo); d.hi=_mm512_mask_div_pd(d.hi,m,d.hi,shi);
+                    } else if (fi.fop==FB_FADD_M) {
+                        d.lo=_mm512_mask_add_pd(d.lo,m,d.lo,slo); d.hi=_mm512_mask_add_pd(d.hi,m,d.hi,shi);
+                    } else {
+                        d.lo=_mm512_mask_sub_pd(d.lo,m,d.lo,slo); d.hi=_mm512_mask_sub_pd(d.hi,m,d.hi,shi);
+                    }
+                    break;
+                }
+                default: break;
+            }
+            for(int l=0;l<LANES;++l) if(pc[l]==pos)++pc[l];
+        }
+    }
+    for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rIn[k], r[k]);
+}
+
+int verifyProgramFull()
+{
+    RandomX_CurrentConfig.Apply();
+    printf("== BatchedVm Stage 6b: full real-program verify (vs executeBytecode) ==\n");
+    const int PROGRAMS = 1000;
+    const uint64_t spWords = 8192;
+    const uint32_t spMaskBytes = (uint32_t)(spWords*8 - 8); (void)spMaskBytes;
+    long fails = 0;
+    rng_s = 0x2545F4914F6CDD1DULL ^ 0x9e3779b97f4a7c15ULL;
+
+    static uint64_t spSnap[LANES][8192];   // pristine scratchpad input per lane
+    static uint64_t spB[LANES*8192];        // batched working scratchpad
+
+    for (int p=0;p<PROGRAMS;++p) {
+        alignas(16) uint8_t seed[64]; for(int i=0;i<64;++i) seed[i]=(uint8_t)rng();
+        randomx::Program program;
+        fillAes4Rx4<false>(seed, 128 + RandomX_CurrentConfig.ProgramSize*8, &program);
+
+        randomx::NativeRegisterFile nregT;
+        static randomx::InstructionByteCode btT[512];
+        randomx::BytecodeMachine bmT; bmT.compileProgram(program, btT, nregT);
+
+        randomx::ProgramConfiguration cfg;
+        {
+            auto staticExp=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>(64-4))<<4; x<<=52; return x; };
+            auto floatMask=[&](uint64_t e){ return (e & ((1ULL<<22)-1)) | staticExp(e); };
+            cfg.eMask[0]=floatMask(program.getEntropy(14));
+            cfg.eMask[1]=floatMask(program.getEntropy(15));
+            cfg.readReg0=cfg.readReg1=cfg.readReg2=cfg.readReg3=0;
+        }
+
+        FullProg fp; fp.count=(int)RandomX_CurrentConfig.ProgramSize;
+        for (int i=0;i<fp.count;++i) translateFull(btT[i], nregT, fp.ins[i]);
+
+        // ---- pristine input state (snapshot) ----
+        uint64_t rSnap[IREGS][LANES];
+        double fLo[8][LANES], fHi[8][LANES], aLo[4][LANES], aHi[4][LANES];
+        for (int lane=0; lane<LANES; ++lane) {
+            for (int k=0;k<IREGS;++k) rSnap[k][lane]=rng();
+            for (int k=0;k<8;++k){ fLo[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0;
+                                   fHi[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0; }
+            for (int k=0;k<4;++k){ aLo[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0;
+                                   aHi[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0; }
+            for (uint64_t w=0; w<spWords; ++w) spSnap[lane][w]=rng();
+        }
+
+        // ---- batched run (copies of inputs) ----
+        uint64_t rB[IREGS][LANES];
+        for (int k=0;k<IREGS;++k) for(int l=0;l<LANES;++l) rB[k][l]=rSnap[k][l];
+        for (int lane=0; lane<LANES; ++lane)
+            for (uint64_t w=0; w<spWords; ++w) spB[lane*spWords+w]=spSnap[lane][w];
+        BFReg Fb[8], Ab[4];
+        for (int k=0;k<8;++k){ Fb[k].lo=_mm512_loadu_pd(fLo[k]); Fb[k].hi=_mm512_loadu_pd(fHi[k]); }
+        for (int k=0;k<4;++k){ Ab[k].lo=_mm512_loadu_pd(aLo[k]); Ab[k].hi=_mm512_loadu_pd(aHi[k]); }
+        runProgramFull(rB, Fb, Ab, spB, spWords, cfg.eMask, fp);
+        // read back batched float f/e registers
+        double Fblo[8][LANES], Fbhi[8][LANES];
+        for (int k=0;k<8;++k){ _mm512_storeu_pd(Fblo[k],Fb[k].lo); _mm512_storeu_pd(Fbhi[k],Fb[k].hi); }
+
+        // ---- scalar ground truth per lane via executeBytecode ----
+        for (int lane=0; lane<LANES; ++lane) {
+            randomx::NativeRegisterFile nr;
+            static randomx::InstructionByteCode bt[512];
+            randomx::BytecodeMachine bm; bm.compileProgram(program, bt, nr);
+            for (int k=0;k<IREGS;++k) nr.r[k]=rSnap[k][lane];
+            for (int k=0;k<randomx::RegisterCountFlt;++k){
+                double lo=fLo[k][lane], hi=fHi[k][lane];
+                nr.f[k]=_mm_set_pd(hi,lo);
+                double elo=fLo[k+4][lane], ehi=fHi[k+4][lane];
+                nr.e[k]=_mm_set_pd(ehi,elo);
+                nr.a[k]=_mm_set_pd(aHi[k][lane],aLo[k][lane]);
+            }
+            uint8_t* sp = reinterpret_cast<uint8_t*>(spSnap[lane]);
+            randomx::BytecodeMachine::executeBytecode(bt, sp, cfg);
+
+            // diff integer regs
+            for (int k=0;k<IREGS;++k)
+                if (rB[k][lane]!=nr.r[k]) { if(fails<6) printf("  MISMATCH prog %d lane %d R%d\n",p,lane,k); ++fails; }
+            // diff float f/e regs (raw bits, NaN-equal)
+            auto cmpF=[&](int gidx, double blo, double bhi, rx_vec_f128 sv){
+                alignas(16) double s[2]; _mm_store_pd(s, sv);
+                uint64_t xb,xs;
+                memcpy(&xb,&blo,8); memcpy(&xs,&s[0],8);
+                bool n1=((xb&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xb&0xfffffffffffffULL);
+                bool n2=((xs&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xs&0xfffffffffffffULL);
+                if (xb!=xs && !(n1&&n2)) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.lo\n",p,lane,gidx); ++fails; }
+                memcpy(&xb,&bhi,8); memcpy(&xs,&s[1],8);
+                n1=((xb&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xb&0xfffffffffffffULL);
+                n2=((xs&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xs&0xfffffffffffffULL);
+                if (xb!=xs && !(n1&&n2)) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.hi\n",p,lane,gidx); ++fails; }
+            };
+            for (int k=0;k<randomx::RegisterCountFlt;++k) cmpF(k,    Fblo[k][lane],   Fbhi[k][lane],   nr.f[k]);
+            for (int k=0;k<randomx::RegisterCountFlt;++k) cmpF(k+4,  Fblo[k+4][lane], Fbhi[k+4][lane], nr.e[k]);
+        }
+    }
+
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, PROGRAMS, LANES);
+    return fails==0?0:1;
+}
 } // namespace batchedx
 } // namespace xmrig

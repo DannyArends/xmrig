@@ -64,6 +64,9 @@ int verifyBranchOps();
 /* Stage 6a: real-program (int/branch) verify. Returns 0 on all-pass. */
 int verifyProgram();
 
+/* Stage 6b: full real-program verify vs executeBytecode. Returns 0 on all-pass. */
+int verifyProgramFull();
+
 } // namespace batchedx
 
 
