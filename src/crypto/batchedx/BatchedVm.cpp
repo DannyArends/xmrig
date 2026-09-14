@@ -84,11 +84,9 @@ void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count
 static inline uint64_t s_rotr(uint64_t x, unsigned c) { c &= 63; return c ? (x >> c) | (x << (64 - c)) : x; }
 static inline uint64_t s_rotl(uint64_t x, unsigned c) { c &= 63; return c ? (x << c) | (x >> (64 - c)) : x; }
 
-static void scalarIntegerProgram(uint64_t regs[IREGS], const BInsn* prog, int count){
-  for (int i = 0; i < count; ++i) {
-    const BInsn& in = prog[i];
+/** Scalar reference for one register-only integer op (IADD_RS..ISMULH_R, ISWAP_R). */
+static inline void applyScalarIntOp(uint64_t regs[IREGS], const BInsn& in, uint64_t s) {
     uint64_t& d = regs[in.dst];
-    const uint64_t s = regs[in.src];
     switch (in.op) {
       case B_IADD_RS: d += (s << in.shift) + in.imm; break;
       case B_ISUB_R:  d -= s; break;
@@ -102,6 +100,13 @@ static void scalarIntegerProgram(uint64_t regs[IREGS], const BInsn* prog, int co
       case B_ISMULH_R: d = (uint64_t)(((__int128)(int64_t)d * (__int128)(int64_t)s) >> 64); break;
       default: break;
     }
+}
+
+static void scalarIntegerProgram(uint64_t regs[IREGS], const BInsn* prog, int count){
+  for (int i = 0; i < count; ++i) {
+    const BInsn& in = prog[i];
+    const uint64_t s = regs[in.src];
+    applyScalarIntOp(regs, in, s);
   }
 }
 
@@ -279,20 +284,8 @@ static void scalarBranchProgram(uint64_t regs[IREGS], const BInsn* prog, int cou
         uint64_t& d = regs[in.dst];
         const uint64_t s = regs[in.src];
         switch (in.op) {
-            case B_IADD_RS: d += (s << in.shift) + in.imm; ++pc; break;
-            case B_ISUB_R:  d -= s; ++pc; break;
-            case B_IMUL_R:  d *= s; ++pc; break;
-            case B_INEG_R:  d = ~d + 1; ++pc; break;
-            case B_IXOR_R:  d ^= s; ++pc; break;
-            case B_IROR_R:  d = s_rotr(d, (unsigned)(s & 63)); ++pc; break;
-            case B_IROL_R:  d = s_rotl(d, (unsigned)(s & 63)); ++pc; break;
-            case B_ISWAP_R: if (in.dst != in.src) { uint64_t t=d; d=regs[in.src]; regs[in.src]=t; } ++pc; break;
-            case B_IMULH_R: d = (uint64_t)(((unsigned __int128)d*(unsigned __int128)s)>>64); ++pc; break;
-            case B_ISMULH_R:d = (uint64_t)(((__int128)(int64_t)d*(__int128)(int64_t)s)>>64); ++pc; break;
-            case B_CBRANCH: d += in.imm;
-                            if ((d & (uint64_t)in.memMask) == 0) pc = in.target; else ++pc;
-                            break;
-            default: ++pc; break;
+            case B_CBRANCH: d += in.imm; if ((d & (uint64_t)in.memMask) == 0) pc = in.target; else ++pc; break;
+            default: applyScalarIntOp(regs, in, s); ++pc; break;
         }
     }
 }
@@ -704,18 +697,8 @@ static void scalarProgramIntBranch(uint64_t regs[IREGS], const BProg& prog)
         if (!prog.ok[pc]) { ++pc; continue; }         // float/mem => no-op
         uint64_t& d=regs[in.dst]; const uint64_t s = in.srcImm ? in.srcVal : regs[in.src];
         switch (in.op) {
-            case B_IADD_RS: d+=(s<<in.shift)+in.imm; ++pc; break;
-            case B_ISUB_R:  d-=s; ++pc; break;
-            case B_IMUL_R:  d*=s; ++pc; break;
-            case B_INEG_R:  d=~d+1; ++pc; break;
-            case B_IXOR_R:  d^=s; ++pc; break;
-            case B_IROR_R:  d=s_rotr(d,(unsigned)(s&63)); ++pc; break;
-            case B_IROL_R:  d=s_rotl(d,(unsigned)(s&63)); ++pc; break;
-            case B_ISWAP_R: if(in.dst!=in.src){uint64_t t=d;d=regs[in.src];regs[in.src]=t;} ++pc; break;
-            case B_IMULH_R: d=(uint64_t)(((unsigned __int128)d*(unsigned __int128)s)>>64); ++pc; break;
-            case B_ISMULH_R:d=(uint64_t)(((__int128)(int64_t)d*(__int128)(int64_t)s)>>64); ++pc; break;
             case B_CBRANCH: d+=in.imm; if((d&(uint64_t)in.memMask)==0) pc=in.target+1; else ++pc; break;
-            default: ++pc; break;
+            default: applyScalarIntOp(regs, in, s); ++pc; break;
         }
     }
 }
