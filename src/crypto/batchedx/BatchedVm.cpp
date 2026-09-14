@@ -883,7 +883,7 @@ static void runProgramFull(uint64_t rIn[IREGS][LANES],
     // E-mask as doubles (per element0/1)
     const __m512d eMaskLo = _mm512_castsi512_pd(_mm512_set1_epi64((long long)eMask[0]));
     const __m512d eMaskHi = _mm512_castsi512_pd(_mm512_set1_epi64((long long)eMask[1]));
-    const __m512d mantMask = _mm512_castsi512_pd(_mm512_set1_epi64((long long)((1ULL<<52)-1)));
+    const __m512d mantMask = _mm512_castsi512_pd(_mm512_set1_epi64((long long)E_MANTISSA_MASK));
 
     int pc[LANES]; for(int l=0;l<LANES;++l) pc[l]=0;
     long steps=0, maxSteps=(long)prog.count*64*LANES;
