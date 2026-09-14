@@ -67,6 +67,7 @@ int verifyProgram();
 /* Stage 6b: full real-program verify vs executeBytecode. Returns 0 on all-pass. */
 int verifyProgramFull();
 int verifyProgramFullRounded();
+int verifyBatchedExecute();
 
 } // namespace batchedx
 
