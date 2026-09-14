@@ -616,6 +616,51 @@ int verifyPerLaneInt()
     return fails==0?0:1;
 }
 
+// ---- Stage 10: per-lane int+branch programs vs 8 independent scalar runs ----
+int verifyPerLaneBranch()
+{
+    printf("== BatchedVm Stage 10: per-lane int+branch programs (8 different programs/lanes) ==\n");
+    rng_s = 0x2545F4914F6CDD1DULL ^ 0xB7E15162ULL;
+    const int TRIALS = 20000;
+    const int PROGLEN = 256;
+    long fails = 0;
+
+    for (int t=0;t<TRIALS;++t){
+        static BInsn prog[LANES][PROGLEN];
+        for (int l=0;l<LANES;++l)
+            for (int i=0;i<PROGLEN;++i){
+                uint64_t r=rng();
+                if ((r & 7)==0){   // ~1/8 CBRANCH
+                    prog[l][i].op=B_CBRANCH; prog[l][i].dst=(r>>8)&7; prog[l][i].imm=rng();
+                    prog[l][i].memMask=(uint32_t)(0xffU<<8);
+                    prog[l][i].target=(int16_t)(i>0?(rng()%i):0);
+                    prog[l][i].src=0; prog[l][i].shift=0;
+                } else {
+                    prog[l][i].op=(BOp)(r%10); prog[l][i].dst=(r>>8)&7; prog[l][i].src=(r>>16)&7;
+                    prog[l][i].shift=(r>>24)&3; prog[l][i].imm=rng();
+                    prog[l][i].memMask=0; prog[l][i].target=0;
+                }
+                prog[l][i].srcImm=false; prog[l][i].srcVal=0;
+            }
+        uint64_t batched[IREGS][LANES];
+        uint64_t scalar[LANES][IREGS];
+        for (int l=0;l<LANES;++l)
+            for (int k=0;k<IREGS;++k){ uint64_t v=rng(); scalar[l][k]=v; batched[k][l]=v; }
+
+        static BInsn flat[LANES*PROGLEN];
+        for (int l=0;l<LANES;++l) for (int i=0;i<PROGLEN;++i) flat[l*PROGLEN+i]=prog[l][i];
+        runPerLaneIntBranch(batched, flat, PROGLEN);
+        for (int l=0;l<LANES;++l) scalarBranchProgram(scalar[l], prog[l], PROGLEN);
+
+        for (int l=0;l<LANES;++l)
+            for (int k=0;k<IREGS;++k)
+                if (batched[k][l]!=scalar[l][k]){ if(fails<8) printf("  MISMATCH trial %d lane %d R%d\n",t,l,k); ++fails; }
+    }
+    printf("== %s (%ld mismatches over %d trials x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, TRIALS, LANES);
+    return fails==0?0:1;
+}
+
 int verifyProgramFull()        { return verifyProgramFullImpl(false, "6b"); }
 int verifyProgramFullRounded() { return verifyProgramFullImpl(true,  "6c"); }
 

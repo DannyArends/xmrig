@@ -491,6 +491,65 @@ void runPerLaneInt(uint64_t regs[IREGS][LANES], const BInsn* prog, int count)
     for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)regs[k], r[k]);
 }
 
+// increment 2: per-lane programs with per-lane pc + CBRANCH (control-flow divergence).
+void runPerLaneIntBranch(uint64_t regs[IREGS][LANES], const BInsn* prog, int count)
+{
+    __m512i r[IREGS];
+    for (int k=0;k<IREGS;++k) r[k]=_mm512_loadu_si512((const void*)regs[k]);
+
+    int  pc[LANES];   for(int l=0;l<LANES;++l) pc[l]=0;
+    long steps[LANES];for(int l=0;l<LANES;++l) steps[l]=0;
+    const long cap=(long)count*64;
+
+    for(;;){
+        __mmask8 active=0;
+        for(int l=0;l<LANES;++l) if(pc[l]>=0 && pc[l]<count && steps[l]<cap) active|=(__mmask8)(1u<<l);
+        if(!active) break;
+
+        alignas(64) long long ov[LANES],dv[LANES],sv[LANES],hv[LANES],iv[LANES],mmv[LANES];
+        int tgt[LANES];
+        for(int l=0;l<LANES;++l){
+            int p=(active&(1u<<l))?pc[l]:0; const BInsn& ib=prog[(size_t)l*count+p];
+            ov[l]=ib.op; dv[l]=ib.dst; sv[l]=ib.src; hv[l]=ib.shift; iv[l]=(long long)ib.imm;
+            mmv[l]=(long long)(uint64_t)ib.memMask; tgt[l]=ib.target;
+        }
+        __m512i op=_mm512_loadu_si512(ov), dst=_mm512_loadu_si512(dv), src=_mm512_loadu_si512(sv),
+                sh=_mm512_loadu_si512(hv), im=_mm512_loadu_si512(iv), memMask=_mm512_loadu_si512(mmv);
+
+        __m512i s=selectReg(r,src), d=selectReg(r,dst), nd=d;
+        auto OP=[&](BOp o){ return _mm512_cmpeq_epi64_mask(op,_mm512_set1_epi64((long long)o)); };
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IADD_RS), _mm512_add_epi64(d,_mm512_add_epi64(_mm512_sllv_epi64(s,sh),im)));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_ISUB_R),  _mm512_sub_epi64(d,s));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IMUL_R),  _mm512_mullo_epi64(d,s));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_INEG_R),  _mm512_add_epi64(_mm512_xor_si512(d,_mm512_set1_epi64(-1)),_mm512_set1_epi64(1)));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IXOR_R),  _mm512_xor_si512(d,s));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IROR_R),  _mm512_rorv_epi64(d,_mm512_and_si512(s,_mm512_set1_epi64(63))));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IROL_R),  _mm512_rolv_epi64(d,_mm512_and_si512(s,_mm512_set1_epi64(63))));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IMULH_R), mulhi_epu64(d,s));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_ISMULH_R),mulhi_epi64(d,s));
+
+        __mmask8 cbm=OP(B_CBRANCH);
+        __m512i d2=_mm512_add_epi64(d,im);         // CBRANCH: dst += imm
+        nd=_mm512_mask_mov_epi64(nd, cbm, d2);
+
+        __mmask8 swm=OP(B_ISWAP_R) & _mm512_cmpneq_epi64_mask(dst,src);
+        nd=_mm512_mask_mov_epi64(nd, swm, s);
+
+        scatterReg(r, dst, nd, active);
+        scatterReg(r, src, d,  swm & active);
+
+        __mmask8 taken = cbm & active &
+            _mm512_cmpeq_epi64_mask(_mm512_and_si512(d2, memMask), _mm512_setzero_si512());
+        for(int l=0;l<LANES;++l){
+            if(!(active&(1u<<l))) continue;
+            ++steps[l];
+            pc[l] = (taken&(1u<<l)) ? tgt[l] : (pc[l]+1);
+        }
+    }
+
+    for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)regs[k], r[k]);
+}
+
 #if defined(__GNUC__)
 #   pragma GCC pop_options
 #endif

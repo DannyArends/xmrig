@@ -70,6 +70,7 @@ int verifyProgramFullRounded();
 int verifyBatchedExecute();
 int verifyBatchedHash();
 int verifyPerLaneInt();
+int verifyPerLaneBranch();
 
 } // namespace batchedx
 
