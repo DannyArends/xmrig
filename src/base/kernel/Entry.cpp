@@ -199,6 +199,7 @@ int xmrig::Entry::exec(const Process &process, Id id)
             printf("batchedx: this CPU has no AVX-512F; batched verify needs an AVX-512 machine.\n");
             return 1;
         }
+        setvbuf(stdout, nullptr, _IONBF, 0);
         int rc = batchedx::verifyIntegerOps();
         rc |= batchedx::verifyFloatOps();
         rc |= batchedx::verifyMemoryOps();
