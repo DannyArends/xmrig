@@ -23,3 +23,18 @@ cp $(ldd xmrig.exe | grep mingw64 | awk '{print $3}') .
 
 ## $$$ profit $$$
 xmrig.exe --batchedx-verify
+
+
+cd ~/Github/xmrig-batched
+rm -rf build
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+  -DWITH_RANDOMX=ON -DWITH_BATCHEDX=ON \
+  -DWITH_CN_LITE=OFF -DWITH_CN_HEAVY=OFF -DWITH_CN_PICO=OFF -DWITH_CN_FEMTO=OFF \
+  -DWITH_ARGON2=OFF -DWITH_KAWPOW=OFF -DWITH_GHOSTRIDER=OFF \
+  -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_NVML=OFF -DWITH_ADL=OFF \
+  -DWITH_HTTP=OFF -DWITH_ENV_VARS=OFF -DWITH_DMI=OFF \
+  -DWITH_BENCHMARK=OFF \
+  -DWITH_HWLOC=ON -DWITH_ASM=ON -DWITH_MSR=ON \
+  -DWITH_SSE4_1=ON -DWITH_AVX2=ON -DWITH_VAES=ON
+make -j$(nproc)

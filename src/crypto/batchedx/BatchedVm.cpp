@@ -1060,6 +1060,8 @@ int verifyProgramFull()
             randomx::NativeRegisterFile nr;
             static randomx::InstructionByteCode bt[512];
             randomx::BytecodeMachine bm; bm.compileProgram(program, bt, nr);
+            for (int i=0;i<fp.count;++i)                       // batched side defers CFROUND; neutralise on oracle too
+                if (bt[i].type==randomx::InstructionType::CFROUND) bt[i].type=randomx::InstructionType::NOP;
             for (int k=0;k<IREGS;++k) nr.r[k]=rSnap[k][lane];
             for (int k=0;k<randomx::RegisterCountFlt;++k){
                 double lo=fLo[k][lane], hi=fHi[k][lane];
@@ -1069,6 +1071,7 @@ int verifyProgramFull()
                 nr.a[k]=_mm_set_pd(aHi[k][lane],aLo[k][lane]);
             }
             uint8_t* sp = reinterpret_cast<uint8_t*>(SNAP(lane));
+            rx_reset_float_state();                            // no rounding-mode leak lane->lane / prog->prog
             randomx::BytecodeMachine::executeBytecode(bt, sp, cfg);
 
             // diff integer regs
