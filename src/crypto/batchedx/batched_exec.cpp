@@ -789,7 +789,7 @@ void runBytecodeVecPerLane(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
         for(int l=0;l<LANES;++l){
             if(!(active&(1u<<l))) continue;
             ++steps[l];
-            pc[l] = (taken&(1u<<l)) ? tgt[l] : (pc[l]+1);
+            pc[l] = (taken&(1u<<l)) ? (tgt[l]+1) : (pc[l]+1);
         }
     }
 }
