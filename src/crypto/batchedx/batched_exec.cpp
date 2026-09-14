@@ -437,7 +437,6 @@ void runBatchedExecute(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
     }
 }
 
-// ---- per-lane programs (increment 1: integer ops, linear, no branch) ----
 // Each lane runs its OWN program. selectReg gathers r[idx[lane]] across the 8
 // register vectors; scatterReg writes it back. Opcode-grouped: one masked pass
 // per opcode present among the 8 lanes at this position.
@@ -455,145 +454,6 @@ static inline void scatterReg(__m512i r[IREGS], __m512i idx, __m512i val, __mmas
 }
 
 // prog is [LANES][count] row-major: lane l instruction i at prog[l*count + i].
-void runPerLaneInt(uint64_t regs[IREGS][LANES], const BInsn* prog, int count)
-{
-    __m512i r[IREGS];
-    for (int k=0;k<IREGS;++k) r[k]=_mm512_loadu_si512((const void*)regs[k]);
-
-    for (int pos=0; pos<count; ++pos) {
-        alignas(64) long long ov[LANES],dv[LANES],sv[LANES],hv[LANES],iv[LANES];
-        for (int l=0;l<LANES;++l){ const BInsn& ib=prog[(size_t)l*count+pos];
-            ov[l]=ib.op; dv[l]=ib.dst; sv[l]=ib.src; hv[l]=ib.shift; iv[l]=(long long)ib.imm; }
-        __m512i op=_mm512_loadu_si512(ov), dst=_mm512_loadu_si512(dv), src=_mm512_loadu_si512(sv),
-                sh=_mm512_loadu_si512(hv), im=_mm512_loadu_si512(iv);
-
-        __m512i s = selectReg(r, src);
-        __m512i d = selectReg(r, dst);
-        __m512i nd = d;
-        auto OP=[&](BOp o){ return _mm512_cmpeq_epi64_mask(op, _mm512_set1_epi64((long long)o)); };
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IADD_RS), _mm512_add_epi64(d,_mm512_add_epi64(_mm512_sllv_epi64(s,sh),im)));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_ISUB_R),  _mm512_sub_epi64(d,s));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IMUL_R),  _mm512_mullo_epi64(d,s));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_INEG_R),  _mm512_add_epi64(_mm512_xor_si512(d,_mm512_set1_epi64(-1)),_mm512_set1_epi64(1)));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IXOR_R),  _mm512_xor_si512(d,s));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IROR_R),  _mm512_rorv_epi64(d,_mm512_and_si512(s,_mm512_set1_epi64(63))));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IROL_R),  _mm512_rolv_epi64(d,_mm512_and_si512(s,_mm512_set1_epi64(63))));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IMULH_R), mulhi_epu64(d,s));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_ISMULH_R),mulhi_epi64(d,s));
-
-        // ISWAP: dst<-src, src<-dst  (only when dst!=src)
-        __mmask8 swm = OP(B_ISWAP_R) & _mm512_cmpneq_epi64_mask(dst, src);
-        nd = _mm512_mask_mov_epi64(nd, swm, s);   // value written to dst for swap lanes
-        scatterReg(r, dst, nd, (__mmask8)0xFF);
-        scatterReg(r, src, d, swm);
-    }
-
-    for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)regs[k], r[k]);
-}
-
-// increment 2: per-lane programs with per-lane pc + CBRANCH (control-flow divergence).
-void runPerLaneIntBranch(uint64_t regs[IREGS][LANES], const BInsn* prog, int count)
-{
-    __m512i r[IREGS];
-    for (int k=0;k<IREGS;++k) r[k]=_mm512_loadu_si512((const void*)regs[k]);
-
-    int  pc[LANES];   for(int l=0;l<LANES;++l) pc[l]=0;
-    long steps[LANES];for(int l=0;l<LANES;++l) steps[l]=0;
-    const long cap=(long)count*64;
-
-    for(;;){
-        __mmask8 active=0;
-        for(int l=0;l<LANES;++l) if(pc[l]>=0 && pc[l]<count && steps[l]<cap) active|=(__mmask8)(1u<<l);
-        if(!active) break;
-
-        alignas(64) long long ov[LANES],dv[LANES],sv[LANES],hv[LANES],iv[LANES],mmv[LANES];
-        int tgt[LANES];
-        for(int l=0;l<LANES;++l){
-            int p=(active&(1u<<l))?pc[l]:0; const BInsn& ib=prog[(size_t)l*count+p];
-            ov[l]=ib.op; dv[l]=ib.dst; sv[l]=ib.src; hv[l]=ib.shift; iv[l]=(long long)ib.imm;
-            mmv[l]=(long long)(uint64_t)ib.memMask; tgt[l]=ib.target;
-        }
-        __m512i op=_mm512_loadu_si512(ov), dst=_mm512_loadu_si512(dv), src=_mm512_loadu_si512(sv),
-                sh=_mm512_loadu_si512(hv), im=_mm512_loadu_si512(iv), memMask=_mm512_loadu_si512(mmv);
-
-        __m512i s=selectReg(r,src), d=selectReg(r,dst), nd=d;
-        auto OP=[&](BOp o){ return _mm512_cmpeq_epi64_mask(op,_mm512_set1_epi64((long long)o)); };
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IADD_RS), _mm512_add_epi64(d,_mm512_add_epi64(_mm512_sllv_epi64(s,sh),im)));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_ISUB_R),  _mm512_sub_epi64(d,s));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IMUL_R),  _mm512_mullo_epi64(d,s));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_INEG_R),  _mm512_add_epi64(_mm512_xor_si512(d,_mm512_set1_epi64(-1)),_mm512_set1_epi64(1)));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IXOR_R),  _mm512_xor_si512(d,s));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IROR_R),  _mm512_rorv_epi64(d,_mm512_and_si512(s,_mm512_set1_epi64(63))));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IROL_R),  _mm512_rolv_epi64(d,_mm512_and_si512(s,_mm512_set1_epi64(63))));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IMULH_R), mulhi_epu64(d,s));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_ISMULH_R),mulhi_epi64(d,s));
-
-        __mmask8 cbm=OP(B_CBRANCH);
-        __m512i d2=_mm512_add_epi64(d,im);         // CBRANCH: dst += imm
-        nd=_mm512_mask_mov_epi64(nd, cbm, d2);
-
-        __mmask8 swm=OP(B_ISWAP_R) & _mm512_cmpneq_epi64_mask(dst,src);
-        nd=_mm512_mask_mov_epi64(nd, swm, s);
-
-        scatterReg(r, dst, nd, active);
-        scatterReg(r, src, d,  swm & active);
-
-        __mmask8 taken = cbm & active &
-            _mm512_cmpeq_epi64_mask(_mm512_and_si512(d2, memMask), _mm512_setzero_si512());
-        for(int l=0;l<LANES;++l){
-            if(!(active&(1u<<l))) continue;
-            ++steps[l];
-            pc[l] = (taken&(1u<<l)) ? tgt[l] : (pc[l]+1);
-        }
-    }
-
-    for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)regs[k], r[k]);
-}
-
-// increment 3: per-lane memory ops (loads + ISTORE), each lane its own scratchpad.
-void runPerLaneMem(uint64_t regs[IREGS][LANES], const BInsn* prog, int count, uint64_t* sp, uint64_t spWords)
-{
-    __m512i r[IREGS];
-    for (int k=0;k<IREGS;++k) r[k]=_mm512_loadu_si512((const void*)regs[k]);
-    const __m512i laneBase = _mm512_set_epi64(
-        (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
-        (long long)(3*spWords),(long long)(2*spWords),(long long)(1*spWords),0LL);
-
-    for (int pos=0; pos<count; ++pos) {
-        alignas(64) long long ov[LANES],dv[LANES],sv[LANES],iv[LANES],mmv[LANES];
-        for (int l=0;l<LANES;++l){ const BInsn& ib=prog[(size_t)l*count+pos];
-            ov[l]=ib.op; dv[l]=ib.dst; sv[l]=ib.src; iv[l]=(long long)ib.imm; mmv[l]=(long long)(uint64_t)ib.memMask; }
-        __m512i op=_mm512_loadu_si512(ov), dst=_mm512_loadu_si512(dv), src=_mm512_loadu_si512(sv),
-                imm=_mm512_loadu_si512(iv), mask=_mm512_loadu_si512(mmv);
-        auto OP=[&](BOp o){ return _mm512_cmpeq_epi64_mask(op,_mm512_set1_epi64((long long)o)); };
-
-        __m512i s=selectReg(r,src), d=selectReg(r,dst);
-        __mmask8 stm=OP(B_ISTORE), ldm=(__mmask8)(~stm);
-
-        __m512i addrS=_mm512_and_si512(_mm512_add_epi64(d,imm),mask);
-        __m512i widxS=_mm512_add_epi64(_mm512_srli_epi64(addrS,3),laneBase);
-        _mm512_mask_i64scatter_epi64((long long*)sp, stm, widxS, s, 8);
-
-        __m512i addrL=_mm512_and_si512(_mm512_add_epi64(s,imm),mask);
-        __m512i widxL=_mm512_add_epi64(_mm512_srli_epi64(addrL,3),laneBase);
-        __m512i v=_mm512_mask_i64gather_epi64(_mm512_setzero_si512(), ldm, widxL, (const long long*)sp, 8);
-
-        __m512i nd=d;
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IADD_M),  _mm512_add_epi64(d,v));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_ISUB_M),  _mm512_sub_epi64(d,v));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IMUL_M),  _mm512_mullo_epi64(d,v));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IMULH_M), mulhi_epu64(d,v));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_ISMULH_M),mulhi_epi64(d,v));
-        nd=_mm512_mask_mov_epi64(nd, OP(B_IXOR_M),  _mm512_xor_si512(d,v));
-        scatterReg(r, dst, nd, ldm);
-    }
-
-    for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)regs[k], r[k]);
-}
-
-// increment 4: per-lane float register ops. selectRegF/scatterRegF are the float
-// analog of selectReg — gather/scatter each lane's F[idx[lane]] (lo+hi) across the
-// FREGS float-register vectors.
 static inline BFReg selectRegF(const BFReg reg[FREGS], __m512i idx)
 {
     BFReg sel = reg[0];
@@ -601,32 +461,6 @@ static inline BFReg selectRegF(const BFReg reg[FREGS], __m512i idx)
         sel.lo=_mm512_mask_mov_pd(sel.lo,mk,reg[k].lo); sel.hi=_mm512_mask_mov_pd(sel.hi,mk,reg[k].hi); }
     return sel;
 }
-static inline void scatterRegF(BFReg reg[FREGS], __m512i idx, BFReg val, __mmask8 active)
-{
-    for (int k=0;k<FREGS;++k){ __mmask8 mk=active & _mm512_cmpeq_epi64_mask(idx,_mm512_set1_epi64(k));
-        reg[k].lo=_mm512_mask_mov_pd(reg[k].lo,mk,val.lo); reg[k].hi=_mm512_mask_mov_pd(reg[k].hi,mk,val.hi); }
-}
-
-void runPerLaneFloat(BFReg reg[FREGS], const FInsn* prog, int count)
-{
-    for (int pos=0; pos<count; ++pos) {
-        alignas(64) long long ov[LANES],dv[LANES],sv[LANES];
-        for (int l=0;l<LANES;++l){ const FInsn& in=prog[(size_t)l*count+pos]; ov[l]=in.op; dv[l]=in.dst; sv[l]=in.src; }
-        __m512i op=_mm512_loadu_si512(ov), dst=_mm512_loadu_si512(dv), src=_mm512_loadu_si512(sv);
-        auto OP=[&](FOp o){ return _mm512_cmpeq_epi64_mask(op,_mm512_set1_epi64((long long)o)); };
-
-        BFReg s=selectRegF(reg,src), d=selectRegF(reg,dst), nd=d;
-        { __mmask8 m=OP(F_FADD_R); nd.lo=_mm512_mask_add_pd(nd.lo,m,d.lo,s.lo); nd.hi=_mm512_mask_add_pd(nd.hi,m,d.hi,s.hi); }
-        { __mmask8 m=OP(F_FSUB_R); nd.lo=_mm512_mask_sub_pd(nd.lo,m,d.lo,s.lo); nd.hi=_mm512_mask_sub_pd(nd.hi,m,d.hi,s.hi); }
-        { __mmask8 m=OP(F_FMUL_R); nd.lo=_mm512_mask_mul_pd(nd.lo,m,d.lo,s.lo); nd.hi=_mm512_mask_mul_pd(nd.hi,m,d.hi,s.hi); }
-        { __mmask8 m=OP(F_FSQRT_R); nd.lo=_mm512_mask_sqrt_pd(nd.lo,m,emask(d.lo)); nd.hi=_mm512_mask_sqrt_pd(nd.hi,m,emask(d.hi)); }
-        { __mmask8 m=OP(F_FSCAL_R); nd.lo=_mm512_mask_mov_pd(nd.lo,m,fscal(d.lo)); nd.hi=_mm512_mask_mov_pd(nd.hi,m,fscal(d.hi)); }
-        { __mmask8 m=OP(F_FSWAP_R); nd.lo=_mm512_mask_mov_pd(nd.lo,m,d.hi); nd.hi=_mm512_mask_mov_pd(nd.hi,m,d.lo); }
-        scatterRegF(reg, dst, nd, (__mmask8)0xFF);
-    }
-}
-
-
 // increment 5a: unified per-lane interpreter — 8 DIFFERENT programs, one per lane,
 // per-lane pc, dispatching int/branch/memory/float/CFROUND together.
 static inline BFReg selectRegF8(const BFReg reg[8], __m512i idx)
