@@ -534,11 +534,11 @@ int verifyBatchedHash()
             for(int i=0;i<fp.count;++i) translateFull(btT[i], nregT, fp.ins[i], true);
 
             __m512i maV=_mm512_set1_epi64((long long)ma0), mxV=_mm512_set1_epi64((long long)mx0);
-            fprintf(stderr, "[8] chain %u: runBatchedExecute (dsoff=%llu)\n", chain, (unsigned long long)datasetOffset);
+            unsigned savedCsr = _mm_getcsr();   // runBatchedExecute clobbers MXCSR; the reference VM's
             runBatchedExecute(rV, Fb, Ab, spB, spWords, cfg.eMask, fp, maV, mxV,
                               (int)cfg.readReg0,(int)cfg.readReg1,(int)cfg.readReg2,(int)cfg.readReg3,
                               datasetOffset, ds, ~0ull, ITER, rmode);
-            fprintf(stderr, "[8] chain %u: vm->run\n", chain);
+            _mm_setcsr(savedCsr);               // rounding mode persists per hash, so restore it before vm->run
 
             vm->run(tempHash);
             randomx::RegisterFile* rf = vm->getRegisterFile();
