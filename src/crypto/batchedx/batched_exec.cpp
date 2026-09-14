@@ -15,9 +15,7 @@ void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count
     const __m512i s = r[in.src];
     switch (in.op) {
       case B_IADD_RS: // dst += (src << shift) + imm
-        d = _mm512_add_epi64(d,
-            _mm512_add_epi64(_mm512_slli_epi64(s, in.shift),
-                     _mm512_set1_epi64((long long)in.imm)));
+        d = _mm512_add_epi64(d, _mm512_add_epi64(_mm512_slli_epi64(s, in.shift), _mm512_set1_epi64((long long)in.imm)));
         break;
       case B_ISUB_R:  // dst -= src
         d = _mm512_sub_epi64(d, s);
@@ -26,8 +24,7 @@ void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count
         d = _mm512_mullo_epi64(d, s);
         break;
       case B_INEG_R:  // dst = ~dst + 1
-        d = _mm512_add_epi64(_mm512_xor_si512(d, _mm512_set1_epi64(-1)),
-                   _mm512_set1_epi64(1));
+        d = _mm512_add_epi64(_mm512_xor_si512(d, _mm512_set1_epi64(-1)), _mm512_set1_epi64(1));
         break;
       case B_IXOR_R:  // dst ^= src
         d = _mm512_xor_si512(d, s);
@@ -203,15 +200,12 @@ static inline void cvtPackedIntPD(__m512i words, __m512d& lo, __m512d& hi) {
     hi = _mm512_cvtepi64_pd(hiI);
 }
 
-void runProgramFull(uint64_t rIn[IREGS][LANES],
-                           BFReg F[8], const BFReg A[4],
-                           uint64_t* sp, uint64_t spWords,
-                           const uint64_t eMask[2],
-                           const FullProg& prog)
+// Interpret one translated program over the given register vectors, in place.
+// No scratchpad framing; the program's own memory ops address sp via laneBase.
+void runBytecodeVec(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
+                    uint64_t* sp, uint64_t spWords,
+                    const uint64_t eMask[2], const FullProg& prog)
 {
-    __m512i r[IREGS];
-    for (int k=0;k<IREGS;++k) r[k]=_mm512_loadu_si512((const void*)rIn[k]);
-
     const __m512i laneBase = _mm512_set_epi64(
         (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
         (long long)(3*spWords),(long long)(2*spWords),(long long)(1*spWords),0LL);
@@ -342,7 +336,16 @@ void runProgramFull(uint64_t rIn[IREGS][LANES],
             for(int l=0;l<LANES;++l) if(pc[l]==pos)++pc[l];
         }
     }
-    for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rIn[k], r[k]);
+}
+
+// Thin wrapper: load int regs, interpret once, store back (Stage 6 entry point).
+void runProgramFull(uint64_t rIn[IREGS][LANES], BFReg F[8], const BFReg A[4],
+                    uint64_t* sp, uint64_t spWords, const uint64_t eMask[2], const FullProg& prog)
+{
+    __m512i r[IREGS];
+    for (int k=0;k<IREGS;++k) r[k]=_mm512_loadu_si512((const void*)rIn[k]);
+    runBytecodeVec(r, F, A, sp, spWords, eMask, prog);
+    for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rIn[k], r[k]);
 }
 
 } // namespace batchedx
