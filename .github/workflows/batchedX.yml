@@ -11,16 +11,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check runner has AVX-512F
-        run: |
-          echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2)"
-          if ! grep -qm1 avx512f /proc/cpuinfo; then
-            echo "::warning::This runner has no AVX-512F. Re-run the job to reroll onto another VM."
-            echo "no_avx512=1" >> "$GITHUB_ENV"
-          fi
+      - name: Report CPU
+        run: echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2)"
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y ccache cmake build-essential libuv1-dev libhwloc-dev libssl-dev
+
+      - name: Install Intel SDE
+        run: |
+          SDE_VER=sde-external-9.33.0-2024-01-07-lin
+          wget -q https://downloadmirror.intel.com/software-kit/792150/${SDE_VER}.tar.xz
+          tar -xf ${SDE_VER}.tar.xz
+          echo "$PWD/${SDE_VER}" >> "$GITHUB_PATH"
 
       - name: Set ccache dir
         run: echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
@@ -56,5 +58,11 @@ jobs:
         run: ccache -s
 
       - name: Run batched verify
-        if: env.no_avx512 != '1'
-        run: ./build/xmrig --batchedx-verify
+        run: |
+          if grep -qm1 avx512f /proc/cpuinfo; then
+            echo "== native AVX-512 =="
+            ./build/xmrig --batchedx-verify
+          else
+            echo "== no AVX-512: emulating with Intel SDE (-icx) =="
+            sde64 -icx -- ./build/xmrig --batchedx-verify
+          fi

@@ -497,6 +497,10 @@ int verifyBatchedHash()
         int rmode[LANES]; for(int l=0;l<LANES;++l) rmode[l]=0;
 
         for(uint32_t chain=0; chain<PC; ++chain){
+            // RandomX starts each program with a fresh register file (nreg.r zero-init,
+            // only a-regs come from the program); integer registers do NOT carry.
+            for(int k=0;k<IREGS;++k) rV[k]=_mm512_setzero_si512();
+            for(int k=0;k<8;++k){ Fb[k].lo=_mm512_setzero_pd(); Fb[k].hi=_mm512_setzero_pd(); }
             randomx::Program program;
             alignas(16) uint64_t seedProg[8]; memcpy(seedProg, tempHash, sizeof(tempHash));
             fillAes4Rx4<false>(seedProg, 128 + RandomX_CurrentConfig.ProgramSize*8, &program);
