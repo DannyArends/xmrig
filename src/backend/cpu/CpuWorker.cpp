@@ -36,6 +36,9 @@
 #include "crypto/rx/RxCache.h"
 #include "crypto/rx/RxDataset.h"
 #include "crypto/rx/RxVm.h"
+#ifdef XMRIG_FEATURE_BATCHEDX
+#   include "crypto/batchedx/BatchedVm.h"
+#endif
 #include "crypto/ghostrider/ghostrider.h"
 #include "net/JobResults.h"
 
@@ -151,6 +154,9 @@ void xmrig::CpuWorker<N>::allocateRandomX_VM()
         randomx_vm_set_cache(m_vm, dataset->cache()->get());
     }
     m_seed = m_job.currentJob().seed();
+#ifdef XMRIG_FEATURE_BATCHEDX
+    m_datasetRaw = reinterpret_cast<const uint64_t*>(dataset->raw());
+#endif
 }
 #endif
 
@@ -160,7 +166,11 @@ bool xmrig::CpuWorker<N>::selfTest()
 {
 #   ifdef XMRIG_ALGO_RANDOMX
     if (m_algorithm.family() == Algorithm::RANDOM_X) {
+#       ifdef XMRIG_FEATURE_BATCHEDX
+        return N == 1 || N == 8;
+#       else
         return N == 1;
+#       endif
     }
 #   endif
 
@@ -294,6 +304,18 @@ void xmrig::CpuWorker<N>::start()
 #           ifdef XMRIG_ALGO_RANDOMX
             uint8_t* miner_signature_ptr = m_job.blob() + m_job.nonceOffset() + m_job.nonceSize();
             if (job.algorithm().family() == Algorithm::RANDOM_X) {
+#           ifdef XMRIG_FEATURE_BATCHEDX
+                if (N == 8 && m_datasetRaw && !job.hasMinerSignature() && !RandomX_CurrentConfig.Tweak_V2_COMMITMENT) {
+                    const void *blobs[8];
+                    for (size_t i = 0; i < N; ++i) { blobs[i] = m_job.blob() + i * job.size(); }
+                    batchedx::batchedHash8(m_datasetRaw, reinterpret_cast<uint64_t*>(m_memory->scratchpad()),
+                                           m_algorithm.l3() / 8, blobs, job.size(), m_hash);
+                    if (!nextRound()) {
+                        break;
+                    }
+                } else
+#           endif
+                {
                 if (first) {
                     first = false;
                     if (job.hasMinerSignature()) {
@@ -323,6 +345,7 @@ void xmrig::CpuWorker<N>::start()
                     randomx_calculate_commitment(prev_job, prev_job_size, m_hash, m_hash);
                     prev_job_size = job.size();
                     memcpy(prev_job, m_job.blob(), prev_job_size);
+                }
                 }
             }
             else

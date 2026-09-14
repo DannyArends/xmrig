@@ -92,7 +92,7 @@ xmrig::CpuThreads::CpuThreads(const rapidjson::Value &value)
         m_affinity           = getAffinityMask(Json::getValue(value, kAffinity));
         m_format             = ObjectFormat;
 
-        if (intensity < 1 || intensity > 5) {
+        if (intensity < 1 || intensity > 8 || (intensity > 5 && intensity != 8)) {
             intensity = 1;
         }
 
