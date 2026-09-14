@@ -39,6 +39,10 @@ struct FullInsn {
 struct FullProg { FullInsn ins[512]; int count; };
 
 // ---- shared scalar / masked helpers (inline, one copy per TU) ----
+#if defined(__GNUC__)
+#   pragma GCC push_options
+#   pragma GCC target("avx512f,avx512dq")
+#endif
 static inline uint64_t s_rotr(uint64_t x, unsigned c) { c &= 63; return c ? (x >> c) | (x << (64 - c)) : x; }
 static inline uint64_t s_rotl(uint64_t x, unsigned c) { c &= 63; return c ? (x << c) | (x >> (64 - c)) : x; }
 
@@ -83,6 +87,10 @@ static inline void applyIntMasked(__m512i r[IREGS], const BInsn& in, __mmask8 m)
         default: break;
     }
 }
+
+#if defined(__GNUC__)
+#   pragma GCC pop_options
+#endif
 
 // ---- cross-TU entry points ----
 void runMemoryProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count, uint64_t* sp, uint64_t spWords);

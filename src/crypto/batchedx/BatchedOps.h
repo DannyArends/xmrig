@@ -10,6 +10,7 @@
 #include "crypto/batchedx/BatchedVm.h"
 
 #if defined(__GNUC__)
+#   pragma GCC push_options
 #   pragma GCC target("avx512f,avx512dq")
 #endif
 
@@ -74,5 +75,9 @@ static inline __m512d fscal(__m512d v) {
 struct BFReg { __m512d lo, hi; };
 
 } } // namespace xmrig::batchedx
+
+#if defined(__GNUC__)
+#   pragma GCC pop_options
+#endif
 
 #endif

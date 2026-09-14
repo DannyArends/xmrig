@@ -15,6 +15,29 @@
 namespace xmrig {
 namespace batchedx {
 
+// [default target] all std::vector / xmrig Rx work lives here, OUTSIDE the AVX-512
+// pragma region, so the vector allocator is never instantiated under a target mismatch.
+struct Stage8Ctx { randomx_vm* vm; const uint64_t* ds; };
+static Stage8Ctx stage8_setup()
+{
+    static const char* key = "batchedx-stage8";
+    static Buffer seed((const uint8_t*)key, (const uint8_t*)key + strlen(key));
+    static RxDataset dataset(false, false, true, RxConfig::FastMode, 0);
+    static bool inited = false;
+    Stage8Ctx c{ nullptr, nullptr };
+    if (!dataset.get()) { printf("  8: dataset alloc failed (FastMode needs ~2GiB)\n"); return c; }
+    if (!inited) { printf("  8: initialising FastMode dataset (may take a while)...\n"); dataset.init(seed, 1, 0); inited = true; }
+    c.vm = RxVm::create(&dataset, nullptr, true, Assembly(), 0);
+    c.ds = (const uint64_t*)randomx_get_dataset_memory(dataset.get());
+    return c;
+}
+static void stage8_teardown(randomx_vm* vm) { if (vm) RxVm::destroy(vm); }
+
+#if defined(__GNUC__)
+#   pragma GCC push_options
+#   pragma GCC target("avx512f,avx512dq")
+#endif
+
 static uint64_t rng_s;
 static inline uint64_t rng() { rng_s ^= rng_s << 13; rng_s ^= rng_s >> 7; rng_s ^= rng_s << 17; return rng_s; }
 
@@ -433,18 +456,13 @@ int verifyBatchedHash()
     const int NHASH = 2;
     long fails = 0;
 
-    const char* key = "batchedx-stage8";
-    Buffer seed; seed.assign((const uint8_t*)key, (const uint8_t*)key + strlen(key));
-    RxDataset dataset(false, false, true, RxConfig::FastMode, 0);
-    if(!dataset.get()){ printf("  8: dataset alloc failed (FastMode needs ~2GiB)\n"); return 1; }
-    printf("  8: initialising FastMode dataset (may take a while)...\n");
-    dataset.init(seed, 1, 0);
-    randomx_vm* vm = RxVm::create(&dataset, nullptr, true, Assembly(), 0);
-    if(!vm){ printf("  8: vm create failed\n"); return 1; }
-    const uint64_t* ds = (const uint64_t*)randomx_get_dataset_memory(dataset.get());
+    Stage8Ctx ctx = stage8_setup();
+    randomx_vm* vm = ctx.vm;
+    const uint64_t* ds = ctx.ds;
+    if(!vm){ printf("  8: vm setup failed\n"); return 1; }
 
     uint64_t* spB = (uint64_t*)malloc((size_t)LANES*spWords*8);
-    if(!spB){ printf("  8: scratchpad alloc failed\n"); RxVm::destroy(vm); return 1; }
+    if(!spB){ printf("  8: scratchpad alloc failed\n"); stage8_teardown(vm); return 1; }
 
     auto getSmallPos=[](uint64_t e)->uint64_t{ uint64_t exp=e>>59, man=e&((1ULL<<52)-1); exp+=1023; exp&=2047; exp<<=52; return exp|man; };
     auto bits2d=[](uint64_t b)->double{ double d; memcpy(&d,&b,8); return d; };
@@ -537,7 +555,7 @@ int verifyBatchedHash()
     }
 
     free(spB);
-    RxVm::destroy(vm);
+    stage8_teardown(vm);
     printf("== %s (%ld mismatches over %d hashes x %d lanes) ==\n",
            fails==0?"ALL PASS":"FAILURES", fails, NHASH, LANES);
     return fails==0?0:1;
@@ -675,6 +693,10 @@ int verifyBatchedExecute()
     free(spB); free(spSn); free(spL); free(ds);
     return fails==0?0:1;
 }
+
+#if defined(__GNUC__)
+#   pragma GCC pop_options
+#endif
 
 } // namespace batchedx
 } // namespace xmrig

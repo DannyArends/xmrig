@@ -4,6 +4,11 @@
 namespace xmrig {
 namespace batchedx {
 
+#if defined(__GNUC__)
+#   pragma GCC push_options
+#   pragma GCC target("avx512f,avx512dq")
+#endif
+
 void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count){
   // load registers into 8 vector registers (one per index, lane = nonce)
   __m512i r[IREGS];
@@ -431,6 +436,10 @@ void runBatchedExecute(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
         spAddr1=_mm512_setzero_si512();
     }
 }
+
+#if defined(__GNUC__)
+#   pragma GCC pop_options
+#endif
 
 } // namespace batchedx
 } // namespace xmrig
