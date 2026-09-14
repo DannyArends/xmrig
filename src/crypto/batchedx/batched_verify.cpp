@@ -710,7 +710,7 @@ int verifyPerLaneHash()
         // batched per-lane pipeline
         alignas(16) uint64_t tempHash[LANES][8];
         for(int l=0;l<LANES;++l) rx_blake2b_default(tempHash[l], 64, input[l], sizeof(input[l]));
-        for(int l=0;l<LANES;++l){ alignas(16) uint64_t sd[8]; memcpy(sd,tempHash[l],64); fillAes1Rx4<false>(sd, spBytes, spB+(size_t)l*spWords); }
+        for(int l=0;l<LANES;++l) fillAes1Rx4<false>(tempHash[l], spBytes, spB+(size_t)l*spWords);   // mutates tempHash like initScratchpad
 
         __m512i rV[IREGS]; for(int k=0;k<IREGS;++k) rV[k]=_mm512_setzero_si512();
         BFReg Fb[8]; for(int k=0;k<8;++k){ Fb[k].lo=_mm512_setzero_pd(); Fb[k].hi=_mm512_setzero_pd(); }
