@@ -69,6 +69,7 @@ int verifyProgramFull();
 int verifyProgramFullRounded();
 int verifyBatchedExecute();
 int verifyBatchedHash();
+int verifyPerLaneInt();
 
 } // namespace batchedx
 

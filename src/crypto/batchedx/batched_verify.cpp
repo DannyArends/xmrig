@@ -25,10 +25,8 @@ static Stage8Ctx stage8_setup()
     static RxDataset dataset(false, false, true, RxConfig::FastMode, 0);
     static bool inited = false;
     Stage8Ctx c{ nullptr, nullptr, nullptr };
-    fprintf(stderr, "[8] ctor: dataset=%p cache=%p\n", (void*)dataset.get(), (void*)dataset.cache());
     if (!dataset.get()) { printf("  8: dataset alloc failed (FastMode needs ~2GiB)\n"); return c; }
-    if (!inited) { fprintf(stderr, "[8] init dataset...\n"); bool ok = dataset.init(seed, 1, 0); fprintf(stderr, "[8] init=%d\n", ok); inited = true; }
-    fprintf(stderr, "[8] create vm...\n");
+    if (!inited) { dataset.init(seed, 1, 0); inited = true; }
     #ifdef _WIN32
       static uint8_t* refScratch = (uint8_t*)_aligned_malloc((size_t)RandomX_CurrentConfig.ScratchpadL3_Size, 4096);
     #else
@@ -39,9 +37,7 @@ static Stage8Ctx stage8_setup()
         nullptr, dataset.get(), refScratch, 0);
     c.vm = refvm;
     c.scratch = refScratch;
-    fprintf(stderr, "[8] vm=%p\n", (void*)c.vm);
     c.ds = (const uint64_t*)randomx_get_dataset_memory(dataset.get());
-    fprintf(stderr, "[8] ds=%p\n", (void*)c.ds);
     return c;
 }
 static void stage8_teardown(randomx_vm* vm) { if (vm) RxVm::destroy(vm); }
@@ -457,7 +453,6 @@ int verifyBatchedHash()
 {
     _mm_setcsr(0x9FC0);
     RandomX_CurrentConfig.Apply();
-    RandomX_CurrentConfig.ProgramIterations = 32;   // TEMP: binary-search the divergent iteration
     printf("== BatchedVm Stage 8: full batched hash (vs randomx_calculate_hash) ==\n");
 
     const uint32_t ITER    = RandomX_CurrentConfig.ProgramIterations;
@@ -492,7 +487,6 @@ int verifyBatchedHash()
             fillAes1Rx4<false>(sd, spBytes, spB + (size_t)lane*spWords);
         }
 
-        fprintf(stderr, "[8] hash %d: initScratchpad\n", n);
         vm->initScratchpad(tempHash);   // reference scratchpad from same seed; mutates tempHash
         vm->resetRoundingMode();
         randomx::RegisterFile* r0 = vm->getRegisterFile();
@@ -543,18 +537,6 @@ int verifyBatchedHash()
             vm->run(tempHash);
             randomx::RegisterFile* rf = vm->getRegisterFile();
 
-            if(n==0 && chain==1){
-                for(int k=0;k<4;++k){
-                    uint64_t alo, ahi; double lo=_mm_cvtsd_f64(_mm512_castpd512_pd128(Ab[k].lo)),
-                                              hi=_mm_cvtsd_f64(_mm512_castpd512_pd128(Ab[k].hi));
-                    memcpy(&alo,&lo,8); memcpy(&ahi,&hi,8);
-                    uint64_t rlo,rhi; memcpy(&rlo,&rf->a[k].lo,8); memcpy(&rhi,&rf->a[k].hi,8);
-                    fprintf(stderr,"[8] a%d batched=%016llx/%016llx ref=%016llx/%016llx\n", k,
-                            (unsigned long long)alo,(unsigned long long)ahi,
-                            (unsigned long long)rlo,(unsigned long long)rhi);
-                }
-            }
-
             uint64_t rOut[IREGS][LANES]; for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rOut[k], rV[k]);
             double Fblo[8][LANES], Fbhi[8][LANES];
             for(int k=0;k<8;++k){ _mm512_storeu_pd(Fblo[k],Fb[k].lo); _mm512_storeu_pd(Fbhi[k],Fb[k].hi); }
@@ -567,15 +549,6 @@ int verifyBatchedHash()
                     if(d2bits(Fblo[k+4][lane])!=d2bits(rf->e[k].lo)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.lo\n",n,chain,lane,k+4); ++fails; }
                     if(d2bits(Fbhi[k+4][lane])!=d2bits(rf->e[k].hi)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.hi\n",n,chain,lane,k+4); ++fails; }
                 }
-            }
-            if(n==0){
-                const uint64_t* refsp = (const uint64_t*)ctx.scratch;
-                long spdiff=-1; for(uint64_t w=0; w<spWords; ++w) if(spB[w]!=refsp[w]){ spdiff=(long)w; break; }
-                unsigned refm=(_mm_getcsr()>>13)&3;
-                fprintf(stderr,"[8] chain %u firstDiffWord=%ld  refMXCSRmode=%u batchedRmode0=%d\n",
-                        chain, spdiff, refm, rmode[0]);
-                if(spdiff>=0) fprintf(stderr,"[8]   sp[%ld] batched=%016llx ref=%016llx\n", spdiff,
-                                      (unsigned long long)spB[spdiff], (unsigned long long)refsp[spdiff]);
             }
             if(chain+1<PC) rx_blake2b_default(tempHash, sizeof(tempHash), rf, sizeof(randomx::RegisterFile));
         }
@@ -602,6 +575,44 @@ int verifyBatchedHash()
     stage8_teardown(vm);
     printf("== %s (%ld mismatches over %d hashes x %d lanes) ==\n",
            fails==0?"ALL PASS":"FAILURES", fails, NHASH, LANES);
+    return fails==0?0:1;
+}
+
+// ---- Stage 9: per-lane programs (integer, linear) vs 8 independent scalar runs ----
+int verifyPerLaneInt()
+{
+    printf("== BatchedVm Stage 9: per-lane integer programs (8 different programs/lanes) ==\n");
+    rng_s = 0x51ED270B5AF3C3E1ULL;
+    const int TRIALS = 20000;
+    const int PROGLEN = 256;
+    long fails = 0;
+
+    for (int t=0;t<TRIALS;++t){
+        static BInsn prog[LANES][PROGLEN];
+        for (int l=0;l<LANES;++l)
+            for (int i=0;i<PROGLEN;++i){
+                uint64_t r=rng();
+                prog[l][i].op=(BOp)(r%10);
+                prog[l][i].dst=(r>>8)&7; prog[l][i].src=(r>>16)&7;
+                prog[l][i].shift=(r>>24)&3; prog[l][i].imm=rng();
+                prog[l][i].srcImm=false; prog[l][i].srcVal=0;
+            }
+        uint64_t batched[IREGS][LANES];
+        uint64_t scalar[LANES][IREGS];
+        for (int l=0;l<LANES;++l)
+            for (int k=0;k<IREGS;++k){ uint64_t v=rng(); scalar[l][k]=v; batched[k][l]=v; }
+
+        static BInsn flat[LANES*PROGLEN];
+        for (int l=0;l<LANES;++l) for (int i=0;i<PROGLEN;++i) flat[l*PROGLEN+i]=prog[l][i];
+        runPerLaneInt(batched, flat, PROGLEN);
+        for (int l=0;l<LANES;++l) scalarIntegerProgram(scalar[l], prog[l], PROGLEN);
+
+        for (int l=0;l<LANES;++l)
+            for (int k=0;k<IREGS;++k)
+                if (batched[k][l]!=scalar[l][k]){ if(fails<8) printf("  MISMATCH trial %d lane %d R%d\n",t,l,k); ++fails; }
+    }
+    printf("== %s (%ld mismatches over %d trials x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, TRIALS, LANES);
     return fails==0?0:1;
 }
 
