@@ -235,7 +235,7 @@ void runBranchProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count)
 
     // safety bound to guarantee termination in the test (real VM relies on RandomX
     // structure; here we cap total steps generously)
-    long steps = 0, maxSteps = (long)count * 64;
+    long steps = 0, maxSteps = (long)count * 64 * LANES;   // scheduler advances a lane-subset per step; budget must scale with LANES (matches 6a/6b)
 
     for (;;) {
         // find min active pc

@@ -9,7 +9,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check runner has AVX-512F
         run: |
@@ -20,11 +20,28 @@ jobs:
           fi
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y cmake build-essential libuv1-dev libhwloc-dev libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y ccache cmake build-essential libuv1-dev libhwloc-dev libssl-dev
+
+      - name: Set ccache dir
+        run: echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Prime ccache
+        run: |
+          ccache -M 500M
+          ccache -z
 
       - name: Configure
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DWITH_RANDOMX=ON -DWITH_BATCHEDX=ON \
             -DWITH_CN_LITE=OFF -DWITH_CN_HEAVY=OFF -DWITH_CN_PICO=OFF -DWITH_CN_FEMTO=OFF \
             -DWITH_ARGON2=OFF -DWITH_KAWPOW=OFF -DWITH_GHOSTRIDER=OFF \
@@ -34,6 +51,9 @@ jobs:
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
+
+      - name: ccache stats
+        run: ccache -s
 
       - name: Run batched verify
         if: env.no_avx512 != '1'
