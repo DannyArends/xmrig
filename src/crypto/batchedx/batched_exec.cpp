@@ -237,7 +237,7 @@ void runProgramFull(uint64_t rIn[IREGS][LANES],
             uint64_t rv[LANES]; _mm512_storeu_si512(rv, r[fi.maddr]);
             for(int l=0;l<LANES;++l) if(pc[l]==pos){
                 uint64_t v=s_rotr(rv[l],(unsigned)fi.fimm);
-                if((v&60)==0) rmode[l]=(int)(v&3);          // Tweak_V2_CFROUND gate; mode = v&3
+                if(!RandomX_CurrentConfig.Tweak_V2_CFROUND || (v&60)==0) rmode[l]=(int)(v&3);  // match exe_CFROUND gate
                 ++pc[l];
             }
             continue;
