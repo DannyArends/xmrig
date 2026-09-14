@@ -11,7 +11,7 @@
 
 #if defined(__GNUC__)
 #   pragma GCC push_options
-#   pragma GCC target("avx512f,avx512dq")
+#   pragma GCC target("avx512f,avx512dq,tune=znver4")
 #endif
 
 namespace xmrig { namespace batchedx {

@@ -44,7 +44,7 @@ static void stage8_teardown(randomx_vm* vm) { if (vm) RxVm::destroy(vm); }
 
 #if defined(__GNUC__)
   #pragma GCC push_options
-  #pragma GCC target("avx512f,avx512dq")
+  #pragma GCC target("avx512f,avx512dq,tune=znver4")
 #endif
 
 static uint64_t rng_s;
