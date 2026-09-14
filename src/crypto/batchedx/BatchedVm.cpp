@@ -238,20 +238,25 @@ void runBranchProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count)
     int pc[LANES];
     for (int l = 0; l < LANES; ++l) pc[l] = 0;
 
-    // safety bound to guarantee termination in the test (real VM relies on RandomX
-    // structure; here we cap total steps generously)
-    long steps = 0, maxSteps = (long)count * 64 * LANES;   // scheduler advances a lane-subset per step; budget must scale with LANES (matches 6a/6b)
+    // Per-lane step budget matching scalarBranchProgram. The synthetic generator can
+    // emit non-terminating loops real RandomX never produces; a global cap would give a
+    // stuck lane the whole budget (starving others), diverging from the per-lane scalar.
+    long lsteps[LANES]; for (int l = 0; l < LANES; ++l) lsteps[l] = 0;
+    const long cap = (long)count * 64;
 
     for (;;) {
         // find min active pc
         int pos = count;
         for (int l = 0; l < LANES; ++l) if (pc[l] < count && pc[l] < pos) pos = pc[l];
         if (pos >= count) break;                 // all lanes done
-        if (++steps > maxSteps) break;
 
-        // active mask = lanes at this position
+        // active mask = lanes at this position, retiring any lane past its budget
         __mmask8 m = 0;
-        for (int l = 0; l < LANES; ++l) if (pc[l] == pos) m |= (1u << l);
+        for (int l = 0; l < LANES; ++l) if (pc[l] == pos) {
+            if (++lsteps[l] > cap) pc[l] = count;   // lane exhausted -> done (matches scalar break)
+            else                   m |= (1u << l);
+        }
+        if (!m) continue;                           // every lane here was exhausted
 
         const BInsn& in = prog[pos];
 
