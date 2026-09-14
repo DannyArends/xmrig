@@ -71,6 +71,7 @@ int verifyBatchedExecute();
 int verifyBatchedHash();
 int verifyPerLaneFull();
 int verifyPerLaneHash();
+void batchedHash8(const uint64_t* dataset, uint64_t* spB, uint64_t spWords, const void* const* blobs, size_t inputSize, uint8_t* out);
 
 } // namespace batchedx
 

@@ -672,120 +672,127 @@ int verifyPerLaneFull()
     return fails==0?0:1;
 }
 
+// ===== production hasher: 8 blobs -> 8 RandomX hashes, 8-wide AVX-512 =====
+// dataset: raw dataset memory (randomx_get_dataset_memory). spB: caller scratchpad,
+// LANES*spWords words. blobs[8]: full job blobs (each with its nonce). out: 8*32 bytes.
+void batchedHash8(const uint64_t* dataset, uint64_t* spB, uint64_t spWords,
+                  const void* const* blobs, size_t inputSize, uint8_t* out)
+{
+    _mm_setcsr(0x9FC0);
+    const uint32_t ITER    = RandomX_CurrentConfig.ProgramIterations;
+    const uint32_t PC      = RandomX_CurrentConfig.ProgramCount;
+    const uint64_t spBytes = RandomX_CurrentConfig.ScratchpadL3_Size;
+    const int PS = (int)RandomX_CurrentConfig.ProgramSize;
+
+    auto getSmallPos=[](uint64_t e)->uint64_t{ uint64_t exp=e>>59, man=e&((1ULL<<52)-1); exp+=1023; exp&=2047; exp<<=52; return exp|man; };
+    auto bits2d=[](uint64_t b)->double{ double d; memcpy(&d,&b,8); return d; };
+    auto floatMask=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>60)<<4; x<<=52; return (e&((1ULL<<22)-1))|x; };
+
+    alignas(16) uint64_t tempHash[LANES][8];
+    for(int l=0;l<LANES;++l) rx_blake2b_default(tempHash[l], 64, blobs[l], inputSize);
+    for(int l=0;l<LANES;++l) fillAes1Rx4<false>(tempHash[l], spBytes, spB+(size_t)l*spWords);
+
+    __m512i rV[IREGS]; for(int k=0;k<IREGS;++k) rV[k]=_mm512_setzero_si512();
+    BFReg Fb[8]; for(int k=0;k<8;++k){ Fb[k].lo=_mm512_setzero_pd(); Fb[k].hi=_mm512_setzero_pd(); }
+    int rmode[LANES]; for(int l=0;l<LANES;++l) rmode[l]=0;
+    double aLo[4][LANES],aHi[4][LANES];
+
+    for(uint32_t chain=0; chain<PC; ++chain){
+        static thread_local FullProg fp[LANES];
+        static thread_local randomx::InstructionByteCode bt[LANES][512];
+        alignas(64) long long r0v[LANES],r1v[LANES],r2v[LANES],r3v[LANES];
+        alignas(64) long long ma0v[LANES],mx0v[LANES],dsoffv[LANES];
+        alignas(64) double emlo[LANES],emhi[LANES];
+
+        for(int l=0;l<LANES;++l){
+            randomx::Program program;
+            alignas(16) uint64_t seedProg[8]; memcpy(seedProg,tempHash[l],64);
+            fillAes4Rx4<false>(seedProg, 128+PS*8, &program);
+            randomx::NativeRegisterFile nregT;
+            randomx::BytecodeMachine bm; bm.compileProgram(program, bt[l], nregT);
+            randomx::ProgramConfiguration cfg;
+            cfg.eMask[0]=floatMask(program.getEntropy(14)); cfg.eMask[1]=floatMask(program.getEntropy(15));
+            uint64_t ar=program.getEntropy(12);
+            r0v[l]=0+(ar&1); ar>>=1; r1v[l]=2+(ar&1); ar>>=1; r2v[l]=4+(ar&1); ar>>=1; r3v[l]=6+(ar&1);
+            ma0v[l]=(long long)(uint32_t)(program.getEntropy(8)&CacheLineAlignMask);
+            mx0v[l]=(long long)(uint32_t)(program.getEntropy(10));
+            dsoffv[l]=(long long)((program.getEntropy(13)%(DatasetExtraItems+1))*randomx::CacheLineSize);
+            memcpy(&emlo[l],&cfg.eMask[0],8); memcpy(&emhi[l],&cfg.eMask[1],8);
+            for(int k=0;k<4;++k){ aLo[k][l]=bits2d(getSmallPos(program.getEntropy(2*k)));
+                                  aHi[k][l]=bits2d(getSmallPos(program.getEntropy(2*k+1))); }
+            fp[l].count=PS; for(int i=0;i<PS;++i) translateFull(bt[l][i], nregT, fp[l].ins[i], true);
+        }
+
+        for(int k=0;k<IREGS;++k) rV[k]=_mm512_setzero_si512();
+        for(int k=0;k<8;++k){ Fb[k].lo=_mm512_setzero_pd(); Fb[k].hi=_mm512_setzero_pd(); }
+        BFReg Ab[4]; for(int k=0;k<4;++k){ Ab[k].lo=_mm512_loadu_pd(aLo[k]); Ab[k].hi=_mm512_loadu_pd(aHi[k]); }
+        __m512i rr0=_mm512_loadu_si512(r0v), rr1=_mm512_loadu_si512(r1v), rr2=_mm512_loadu_si512(r2v), rr3=_mm512_loadu_si512(r3v);
+        __m512i maV=_mm512_loadu_si512(ma0v), mxV=_mm512_loadu_si512(mx0v), dsoff=_mm512_loadu_si512(dsoffv);
+        __m512d eLo=_mm512_loadu_pd(emlo), eHi=_mm512_loadu_pd(emhi);
+
+        unsigned savedCsr=_mm_getcsr();
+        runBatchedExecutePerLane(rV, Fb, Ab, spB, spWords, eLo, eHi, fp, maV, mxV,
+                                 rr0, rr1, rr2, rr3, dsoff, dataset, ~0ull, ITER, rmode);
+        _mm_setcsr(savedCsr);
+
+        if(chain+1<PC){
+            uint64_t rOut[IREGS][LANES]; for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rOut[k], rV[k]);
+            double Flo[8][LANES],Fhi[8][LANES];
+            for(int k=0;k<8;++k){ _mm512_storeu_pd(Flo[k],Fb[k].lo); _mm512_storeu_pd(Fhi[k],Fb[k].hi); }
+            for(int l=0;l<LANES;++l){
+                randomx::RegisterFile rf; memset(&rf,0,sizeof(rf));
+                for(int k=0;k<IREGS;++k) rf.r[k]=rOut[k][l];
+                for(int k=0;k<4;++k){ rf.f[k].lo=Flo[k][l]; rf.f[k].hi=Fhi[k][l];
+                                      rf.e[k].lo=Flo[k+4][l]; rf.e[k].hi=Fhi[k+4][l];
+                                      rf.a[k].lo=aLo[k][l]; rf.a[k].hi=aHi[k][l]; }
+                rx_blake2b_default(tempHash[l], 64, &rf, sizeof(randomx::RegisterFile));
+            }
+        }
+    }
+
+    uint64_t rOut[IREGS][LANES]; for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rOut[k], rV[k]);
+    double Flo[8][LANES],Fhi[8][LANES];
+    for(int k=0;k<8;++k){ _mm512_storeu_pd(Flo[k],Fb[k].lo); _mm512_storeu_pd(Fhi[k],Fb[k].hi); }
+    for(int l=0;l<LANES;++l){
+        randomx::RegisterFile rf; memset(&rf,0,sizeof(rf));
+        for(int k=0;k<IREGS;++k) rf.r[k]=rOut[k][l];
+        for(int k=0;k<4;++k){ rf.f[k].lo=Flo[k][l]; rf.f[k].hi=Fhi[k][l];
+                              rf.e[k].lo=Flo[k+4][l]; rf.e[k].hi=Fhi[k+4][l];
+                              rf.a[k].lo=aLo[k][l]; rf.a[k].hi=aHi[k][l]; }
+        hashAes1Rx4<false>(spB+(size_t)l*spWords, spBytes, &rf.a);
+        rx_blake2b_default(out+(size_t)l*32, 32, &rf, sizeof(randomx::RegisterFile));
+    }
+}
+
 // ---- Stage 14: full per-lane hash — 8 DIFFERENT nonces vs 8x randomx_calculate_hash ----
 int verifyPerLaneHash()
 {
     _mm_setcsr(0x9FC0);
     RandomX_CurrentConfig.Apply();
-    printf("== BatchedVm Stage 14: full per-lane hash (8 different nonces) ==\n");
-
-    const uint32_t ITER    = RandomX_CurrentConfig.ProgramIterations;
-    const uint32_t PC      = RandomX_CurrentConfig.ProgramCount;
-    const uint64_t spBytes = RandomX_CurrentConfig.ScratchpadL3_Size;
-    const uint64_t spWords = spBytes / 8;
-    const int PS = (int)RandomX_CurrentConfig.ProgramSize;
+    printf("== BatchedVm Stage 14: full per-lane hash via batchedHash8 (8 different nonces) ==\n");
+    const uint64_t spWords = RandomX_CurrentConfig.ScratchpadL3_Size / 8;
     const int NBATCH = 2;
     long fails = 0;
 
     Stage8Ctx ctx = stage8_setup();
     randomx_vm* vm = ctx.vm; const uint64_t* ds = ctx.ds;
     if(!vm){ printf("  14: vm setup failed\n"); return 1; }
-
     uint64_t* spB=(uint64_t*)malloc((size_t)LANES*spWords*8);
     if(!spB){ printf("  14: scratchpad alloc failed\n"); stage8_teardown(vm); return 1; }
 
-    auto getSmallPos=[](uint64_t e)->uint64_t{ uint64_t exp=e>>59, man=e&((1ULL<<52)-1); exp+=1023; exp&=2047; exp<<=52; return exp|man; };
-    auto bits2d=[](uint64_t b)->double{ double d; memcpy(&d,&b,8); return d; };
-    auto floatMask=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>60)<<4; x<<=52; return (e&((1ULL<<22)-1))|x; };
-
     for(int nb=0; nb<NBATCH; ++nb){
         alignas(16) uint64_t input[LANES][8];
-        for(int l=0;l<LANES;++l) for(int i=0;i<8;++i)
-            input[l][i]=0x9e3779b97f4a7c15ULL*(uint64_t)(nb*LANES+l+1)+(uint64_t)i;
+        const void* blobs[LANES];
+        for(int l=0;l<LANES;++l){ for(int i=0;i<8;++i) input[l][i]=0x9e3779b97f4a7c15ULL*(uint64_t)(nb*LANES+l+1)+(uint64_t)i; blobs[l]=input[l]; }
 
-        // reference hashes first (before batched clobbers MXCSR)
         alignas(16) uint8_t refOut[LANES][32];
         for(int l=0;l<LANES;++l) randomx_calculate_hash(vm, input[l], sizeof(input[l]), refOut[l]);
 
-        // batched per-lane pipeline
-        alignas(16) uint64_t tempHash[LANES][8];
-        for(int l=0;l<LANES;++l) rx_blake2b_default(tempHash[l], 64, input[l], sizeof(input[l]));
-        for(int l=0;l<LANES;++l) fillAes1Rx4<false>(tempHash[l], spBytes, spB+(size_t)l*spWords);   // mutates tempHash like initScratchpad
+        alignas(16) uint8_t out[LANES*32];
+        batchedHash8(ds, spB, spWords, blobs, sizeof(input[0]), out);
 
-        __m512i rV[IREGS]; for(int k=0;k<IREGS;++k) rV[k]=_mm512_setzero_si512();
-        BFReg Fb[8]; for(int k=0;k<8;++k){ Fb[k].lo=_mm512_setzero_pd(); Fb[k].hi=_mm512_setzero_pd(); }
-        int rmode[LANES]; for(int l=0;l<LANES;++l) rmode[l]=0;
-
-        double aLo[4][LANES],aHi[4][LANES];   // kept for final/chain assembly
-
-        for(uint32_t chain=0; chain<PC; ++chain){
-            static FullProg fp[LANES];
-            static randomx::InstructionByteCode bt[LANES][512];
-            alignas(64) long long r0v[LANES],r1v[LANES],r2v[LANES],r3v[LANES];
-            alignas(64) long long ma0v[LANES],mx0v[LANES],dsoffv[LANES];
-            alignas(64) double emlo[LANES],emhi[LANES];
-
-            for(int l=0;l<LANES;++l){
-                randomx::Program program;
-                alignas(16) uint64_t seedProg[8]; memcpy(seedProg,tempHash[l],64);
-                fillAes4Rx4<false>(seedProg, 128+PS*8, &program);
-                randomx::NativeRegisterFile nregT;
-                randomx::BytecodeMachine bm; bm.compileProgram(program, bt[l], nregT);
-                randomx::ProgramConfiguration cfg;
-                cfg.eMask[0]=floatMask(program.getEntropy(14)); cfg.eMask[1]=floatMask(program.getEntropy(15));
-                uint64_t ar=program.getEntropy(12);
-                r0v[l]=0+(ar&1); ar>>=1; r1v[l]=2+(ar&1); ar>>=1; r2v[l]=4+(ar&1); ar>>=1; r3v[l]=6+(ar&1);
-                ma0v[l]=(long long)(uint32_t)(program.getEntropy(8)&CacheLineAlignMask);
-                mx0v[l]=(long long)(uint32_t)(program.getEntropy(10));
-                dsoffv[l]=(long long)((program.getEntropy(13)%(DatasetExtraItems+1))*randomx::CacheLineSize);
-                memcpy(&emlo[l],&cfg.eMask[0],8); memcpy(&emhi[l],&cfg.eMask[1],8);
-                for(int k=0;k<4;++k){ aLo[k][l]=bits2d(getSmallPos(program.getEntropy(2*k)));
-                                      aHi[k][l]=bits2d(getSmallPos(program.getEntropy(2*k+1))); }
-                fp[l].count=PS; for(int i=0;i<PS;++i) translateFull(bt[l][i], nregT, fp[l].ins[i], true);
-            }
-
-            for(int k=0;k<IREGS;++k) rV[k]=_mm512_setzero_si512();
-            for(int k=0;k<8;++k){ Fb[k].lo=_mm512_setzero_pd(); Fb[k].hi=_mm512_setzero_pd(); }
-            BFReg Ab[4]; for(int k=0;k<4;++k){ Ab[k].lo=_mm512_loadu_pd(aLo[k]); Ab[k].hi=_mm512_loadu_pd(aHi[k]); }
-            __m512i rr0=_mm512_loadu_si512(r0v), rr1=_mm512_loadu_si512(r1v), rr2=_mm512_loadu_si512(r2v), rr3=_mm512_loadu_si512(r3v);
-            __m512i maV=_mm512_loadu_si512(ma0v), mxV=_mm512_loadu_si512(mx0v), dsoff=_mm512_loadu_si512(dsoffv);
-            __m512d eLo=_mm512_loadu_pd(emlo), eHi=_mm512_loadu_pd(emhi);
-
-            unsigned savedCsr=_mm_getcsr();
-            runBatchedExecutePerLane(rV, Fb, Ab, spB, spWords, eLo, eHi, fp, maV, mxV,
-                                     rr0, rr1, rr2, rr3, dsoff, ds, ~0ull, ITER, rmode);
-            _mm_setcsr(savedCsr);
-
-            if(chain+1<PC){
-                uint64_t rOut[IREGS][LANES]; for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rOut[k], rV[k]);
-                double Flo[8][LANES],Fhi[8][LANES];
-                for(int k=0;k<8;++k){ _mm512_storeu_pd(Flo[k],Fb[k].lo); _mm512_storeu_pd(Fhi[k],Fb[k].hi); }
-                for(int l=0;l<LANES;++l){
-                    randomx::RegisterFile rf; memset(&rf,0,sizeof(rf));
-                    for(int k=0;k<IREGS;++k) rf.r[k]=rOut[k][l];
-                    for(int k=0;k<4;++k){ rf.f[k].lo=Flo[k][l]; rf.f[k].hi=Fhi[k][l];
-                                          rf.e[k].lo=Flo[k+4][l]; rf.e[k].hi=Fhi[k+4][l];
-                                          rf.a[k].lo=aLo[k][l]; rf.a[k].hi=aHi[k][l]; }
-                    rx_blake2b_default(tempHash[l], 64, &rf, sizeof(randomx::RegisterFile));
-                }
-            }
-        }
-
-        // final hash per lane
-        uint64_t rOut[IREGS][LANES]; for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rOut[k], rV[k]);
-        double Flo[8][LANES],Fhi[8][LANES];
-        for(int k=0;k<8;++k){ _mm512_storeu_pd(Flo[k],Fb[k].lo); _mm512_storeu_pd(Fhi[k],Fb[k].hi); }
-        for(int l=0;l<LANES;++l){
-            randomx::RegisterFile rf; memset(&rf,0,sizeof(rf));
-            for(int k=0;k<IREGS;++k) rf.r[k]=rOut[k][l];
-            for(int k=0;k<4;++k){ rf.f[k].lo=Flo[k][l]; rf.f[k].hi=Fhi[k][l];
-                                  rf.e[k].lo=Flo[k+4][l]; rf.e[k].hi=Fhi[k+4][l];
-                                  rf.a[k].lo=aLo[k][l]; rf.a[k].hi=aHi[k][l]; }
-            hashAes1Rx4<false>(spB+(size_t)l*spWords, spBytes, &rf.a);
-            alignas(16) uint8_t out[32];
-            rx_blake2b_default(out, 32, &rf, sizeof(randomx::RegisterFile));
-            if(memcmp(out, refOut[l], 32)!=0){ if(fails<8) printf("  MISMATCH batch %d nonce/lane %d final\n",nb,l); ++fails; }
-        }
+        for(int l=0;l<LANES;++l)
+            if(memcmp(out+(size_t)l*32, refOut[l], 32)!=0){ if(fails<8) printf("  MISMATCH batch %d nonce/lane %d final\n",nb,l); ++fails; }
     }
     free(spB); stage8_teardown(vm);
     printf("== %s (%ld mismatches over %d batches x %d nonces) ==\n",
