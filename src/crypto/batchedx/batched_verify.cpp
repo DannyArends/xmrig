@@ -479,13 +479,17 @@ int verifyBatchedHash()
 
         alignas(16) uint64_t tempHash[8];
         rx_blake2b_default(tempHash, sizeof(tempHash), input, sizeof(input));
-        fprintf(stderr, "[8] initScratchpad\n");
-        vm->initScratchpad(tempHash);
-        vm->resetRoundingMode();
-        fprintf(stderr, "[8] batched scratchpad init\n");
 
-        for(int lane=0;lane<LANES;++lane)
-            fillAes1Rx4<false>(tempHash, spBytes, spB + (size_t)lane*spWords);
+        // batched scratchpad from the ORIGINAL seed, fresh copy per lane
+        // (fillAes1Rx4 writes the evolved state back to its seed arg).
+        for(int lane=0;lane<LANES;++lane){
+            alignas(16) uint64_t sd[8]; memcpy(sd, tempHash, sizeof(tempHash));
+            fillAes1Rx4<false>(sd, spBytes, spB + (size_t)lane*spWords);
+        }
+
+        fprintf(stderr, "[8] hash %d: initScratchpad\n", n);
+        vm->initScratchpad(tempHash);   // reference scratchpad from same seed; mutates tempHash
+        vm->resetRoundingMode();
         randomx::RegisterFile* r0 = vm->getRegisterFile();
         __m512i rV[IREGS];
         for(int k=0;k<IREGS;++k) rV[k]=_mm512_set1_epi64((long long)r0->r[k]);
@@ -494,7 +498,8 @@ int verifyBatchedHash()
 
         for(uint32_t chain=0; chain<PC; ++chain){
             randomx::Program program;
-            fillAes4Rx4<false>(tempHash, 128 + RandomX_CurrentConfig.ProgramSize*8, &program);
+            alignas(16) uint64_t seedProg[8]; memcpy(seedProg, tempHash, sizeof(tempHash));
+            fillAes4Rx4<false>(seedProg, 128 + RandomX_CurrentConfig.ProgramSize*8, &program);
             randomx::NativeRegisterFile nregT;
             static randomx::InstructionByteCode btT[512];
             randomx::BytecodeMachine bmT; bmT.compileProgram(program, btT, nregT);
