@@ -551,7 +551,7 @@ int verifyBatchedHash()
                     if(d2bits(Fbhi[k+4][lane])!=d2bits(rf->e[k].hi)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.hi\n",n,chain,lane,k+4); ++fails; }
                 }
             }
-            if(n==0 && chain==0){
+            if(n==0){
                 const uint64_t* refsp = (const uint64_t*)ctx.scratch;
                 long spdiff=-1; for(uint64_t w=0; w<spWords; ++w) if(spB[w]!=refsp[w]){ spdiff=(long)w; break; }
                 fprintf(stderr,"[8] chain0 scratchpad firstDiffWord=%ld (spWords=%llu)\n", spdiff, (unsigned long long)spWords);
