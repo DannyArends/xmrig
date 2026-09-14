@@ -5,6 +5,7 @@
  */
 
 #include "crypto/batchedx/BatchedVm.h"
+#include "crypto/batchedx/BatchedOps.h"
 
 #include <immintrin.h>
 #include <cstdio>
@@ -23,51 +24,10 @@ namespace batchedx {
 
 // ---- AVX-512 helpers ----------------------------------------------------------
 
-// per-lane variable rotate-right by (amt & 63): AVX-512 has _mm512_rorv_epi64
-static inline __m512i rorv64(__m512i x, __m512i amt) {
-  return _mm512_rorv_epi64(x, _mm512_and_si512(amt, _mm512_set1_epi64(63)));
-}
-static inline __m512i rolv64(__m512i x, __m512i amt) {
-  return _mm512_rolv_epi64(x, _mm512_and_si512(amt, _mm512_set1_epi64(63)));
-}
 
 
 // 64x64 -> high 64 across 8 lanes. AVX-512 has no 64-bit high-mul; synthesize from
 // 32x32 partial products (schoolbook), then correct for signedness if needed.
-static inline __m512i mulhi_epu64(__m512i a, __m512i b) {
-    const __m512i lo32 = _mm512_set1_epi64(0xffffffffULL);
-    __m512i al = _mm512_and_si512(a, lo32);
-    __m512i ah = _mm512_srli_epi64(a, 32);
-    __m512i bl = _mm512_and_si512(b, lo32);
-    __m512i bh = _mm512_srli_epi64(b, 32);
-
-    __m512i ll = _mm512_mul_epu32(al, bl);          // al*bl
-    __m512i lh = _mm512_mul_epu32(al, bh);          // al*bh
-    __m512i hl = _mm512_mul_epu32(ah, bl);          // ah*bl
-    __m512i hh = _mm512_mul_epu32(ah, bh);          // ah*bh
-
-    // cross = (ll>>32) + (lh & lo32) + (hl & lo32)
-    __m512i cross = _mm512_add_epi64(_mm512_srli_epi64(ll, 32),
-                    _mm512_add_epi64(_mm512_and_si512(lh, lo32),
-                                     _mm512_and_si512(hl, lo32)));
-    // high = hh + (lh>>32) + (hl>>32) + (cross>>32)
-    __m512i high = _mm512_add_epi64(hh,
-                   _mm512_add_epi64(_mm512_srli_epi64(lh, 32),
-                   _mm512_add_epi64(_mm512_srli_epi64(hl, 32),
-                                    _mm512_srli_epi64(cross, 32))));
-    return high;
-}
-
-// signed high-mul: umulh(a,b) - (a<0 ? b : 0) - (b<0 ? a : 0)
-static inline __m512i mulhi_epi64(__m512i a, __m512i b) {
-    __m512i u = mulhi_epu64(a, b);
-    const __m512i zero = _mm512_setzero_si512();
-    __mmask8 an = _mm512_cmplt_epi64_mask(a, zero);
-    __mmask8 bn = _mm512_cmplt_epi64_mask(b, zero);
-    u = _mm512_mask_sub_epi64(u, an, u, b);
-    u = _mm512_mask_sub_epi64(u, bn, u, a);
-    return u;
-}
 
 // ---- batched integer program execution ---------------------------------------
 
@@ -409,18 +369,8 @@ struct FInsn { FOp op; uint8_t dst; uint8_t src; };   // dst/src index 0..FREGS-
 static constexpr int FREGS = 4;   // RandomX f-group registers
 
 // FSCAL mask 0x80F0000000000000 applied to the raw bits of each double
-static const uint64_t FSCAL_MASK = 0x80F0000000000000ULL;
 
 // E-register exponent/mantissa mask (RandomX keeps E-regs positive & bounded).
-static const uint64_t E_MANTISSA_MASK = (1ULL << 56) - 1;      // dynamicMantissaMask
-static const uint64_t E_EXP_MASK      = 0x3000000000000000ULL; // constExponentBits(0x300)<<52
-
-static inline __m512d emask(__m512d v) {
-    __m512i b = _mm512_castpd_si512(v);
-    b = _mm512_and_si512(b, _mm512_set1_epi64((long long)E_MANTISSA_MASK));
-    b = _mm512_or_si512 (b, _mm512_set1_epi64((long long)E_EXP_MASK));
-    return _mm512_castsi512_pd(b);
-}
 
 static inline double emask_s(double v) {
     uint64_t b; memcpy(&b, &v, 8);
@@ -436,12 +386,7 @@ static inline bool bothNaN(uint64_t a, uint64_t b) {
 }
 
 // batched: reg[k].lo / reg[k].hi are __m512d (8 lanes)
-struct BFReg { __m512d lo, hi; };
 
-static inline __m512d fscal(__m512d v) {
-    const __m512i m = _mm512_set1_epi64((long long)FSCAL_MASK);
-    return _mm512_castsi512_pd(_mm512_xor_si512(_mm512_castpd_si512(v), m));
-}
 
 static void runFloatProgram(BFReg reg[FREGS], const FInsn* prog, int count)
 {
