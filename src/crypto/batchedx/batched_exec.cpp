@@ -205,6 +205,8 @@ static inline void cvtPackedIntPD(__m512i words, __m512d& lo, __m512d& hi) {
     hi = _mm512_cvtepi64_pd(hiI);
 }
 
+uint64_t* g_bxTrace = nullptr;  // debug: lane0 r[0..7] per iteration
+
 // Interpret one translated program over the given register vectors, in place.
 // No scratchpad framing; the program's own memory ops address sp via laneBase.
 void runBytecodeVec(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
@@ -431,6 +433,8 @@ void runBatchedExecute(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
             _mm512_i64scatter_epi64((long long*)sp, _mm512_add_epi64(w0,_mm512_set1_epi64(2*i+1)),
                                     _mm512_castpd_si512(F[i].hi), 8);
         }
+
+        if(g_bxTrace){ for(int k=0;k<IREGS;++k){ alignas(64) uint64_t t[LANES]; _mm512_storeu_si512(t,r[k]); g_bxTrace[(size_t)ic*IREGS+k]=t[0]; } }
 
         spAddr0=_mm512_setzero_si512();
         spAddr1=_mm512_setzero_si512();

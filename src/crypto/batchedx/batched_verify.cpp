@@ -29,8 +29,15 @@ static Stage8Ctx stage8_setup()
     if (!dataset.get()) { printf("  8: dataset alloc failed (FastMode needs ~2GiB)\n"); return c; }
     if (!inited) { fprintf(stderr, "[8] init dataset...\n"); bool ok = dataset.init(seed, 1, 0); fprintf(stderr, "[8] init=%d\n", ok); inited = true; }
     fprintf(stderr, "[8] create vm...\n");
-    static uint8_t* refScratch = (uint8_t*)aligned_alloc(4096, (size_t)RandomX_CurrentConfig.ScratchpadL3_Size);
-    c.vm = RxVm::create(&dataset, refScratch, false /*hardware AES; matches batched fillAes<false>*/, Assembly(), 0);
+    #ifdef _WIN32
+      static uint8_t* refScratch = (uint8_t*)_aligned_malloc((size_t)RandomX_CurrentConfig.ScratchpadL3_Size, 4096);
+    #else
+      static uint8_t* refScratch = (uint8_t*)aligned_alloc(4096, (size_t)RandomX_CurrentConfig.ScratchpadL3_Size);
+    #endif
+    randomx_vm* refvm = randomx_create_vm(
+        static_cast<randomx_flags>(RANDOMX_FLAG_FULL_MEM | RANDOMX_FLAG_HARD_AES),
+        nullptr, dataset.get(), refScratch, 0);
+    c.vm = refvm;
     c.scratch = refScratch;
     fprintf(stderr, "[8] vm=%p\n", (void*)c.vm);
     c.ds = (const uint64_t*)randomx_get_dataset_memory(dataset.get());
@@ -40,17 +47,15 @@ static Stage8Ctx stage8_setup()
 static void stage8_teardown(randomx_vm* vm) { if (vm) RxVm::destroy(vm); }
 
 #if defined(__GNUC__)
-#   pragma GCC push_options
-#   pragma GCC target("avx512f,avx512dq")
+  #pragma GCC push_options
+  #pragma GCC target("avx512f,avx512dq")
 #endif
 
 static uint64_t rng_s;
 static inline uint64_t rng() { rng_s ^= rng_s << 13; rng_s ^= rng_s >> 7; rng_s ^= rng_s << 17; return rng_s; }
 
-static inline bool bothNaN(uint64_t a, uint64_t b) {
-    // exponent all ones + nonzero mantissa = NaN (ignore sign)
-    auto isnan = [](uint64_t x){ return ((x & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
-                                     && (x & 0x000fffffffffffffULL); };
+static inline bool bothNaN(uint64_t a, uint64_t b) { // exponent all ones + nonzero mantissa = NaN (ignore sign)
+    auto isnan = [](uint64_t x){ return ((x & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL) && (x & 0x000fffffffffffffULL); };
     return isnan(a) && isnan(b);
 }
 
@@ -102,8 +107,7 @@ int verifyIntegerOps(){
         }
   }
 
-  printf("== %s (%d mismatches over %d programs x %d lanes) ==\n",
-       fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
+  printf("== %s (%d mismatches over %d programs x %d lanes) ==\n", fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
   return fails == 0 ? 0 : 1;
 }
 
@@ -453,6 +457,7 @@ int verifyBatchedHash()
 {
     _mm_setcsr(0x9FC0);
     RandomX_CurrentConfig.Apply();
+    RandomX_CurrentConfig.ProgramIterations = 32;   // TEMP: binary-search the divergent iteration
     printf("== BatchedVm Stage 8: full batched hash (vs randomx_calculate_hash) ==\n");
 
     const uint32_t ITER    = RandomX_CurrentConfig.ProgramIterations;
@@ -538,6 +543,18 @@ int verifyBatchedHash()
             vm->run(tempHash);
             randomx::RegisterFile* rf = vm->getRegisterFile();
 
+            if(n==0 && chain==1){
+                for(int k=0;k<4;++k){
+                    uint64_t alo, ahi; double lo=_mm_cvtsd_f64(_mm512_castpd512_pd128(Ab[k].lo)),
+                                              hi=_mm_cvtsd_f64(_mm512_castpd512_pd128(Ab[k].hi));
+                    memcpy(&alo,&lo,8); memcpy(&ahi,&hi,8);
+                    uint64_t rlo,rhi; memcpy(&rlo,&rf->a[k].lo,8); memcpy(&rhi,&rf->a[k].hi,8);
+                    fprintf(stderr,"[8] a%d batched=%016llx/%016llx ref=%016llx/%016llx\n", k,
+                            (unsigned long long)alo,(unsigned long long)ahi,
+                            (unsigned long long)rlo,(unsigned long long)rhi);
+                }
+            }
+
             uint64_t rOut[IREGS][LANES]; for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rOut[k], rV[k]);
             double Fblo[8][LANES], Fbhi[8][LANES];
             for(int k=0;k<8;++k){ _mm512_storeu_pd(Fblo[k],Fb[k].lo); _mm512_storeu_pd(Fbhi[k],Fb[k].hi); }
@@ -554,11 +571,11 @@ int verifyBatchedHash()
             if(n==0){
                 const uint64_t* refsp = (const uint64_t*)ctx.scratch;
                 long spdiff=-1; for(uint64_t w=0; w<spWords; ++w) if(spB[w]!=refsp[w]){ spdiff=(long)w; break; }
-                fprintf(stderr,"[8] chain0 scratchpad firstDiffWord=%ld (spWords=%llu)\n", spdiff, (unsigned long long)spWords);
+                unsigned refm=(_mm_getcsr()>>13)&3;
+                fprintf(stderr,"[8] chain %u firstDiffWord=%ld  refMXCSRmode=%u batchedRmode0=%d\n",
+                        chain, spdiff, refm, rmode[0]);
                 if(spdiff>=0) fprintf(stderr,"[8]   sp[%ld] batched=%016llx ref=%016llx\n", spdiff,
                                       (unsigned long long)spB[spdiff], (unsigned long long)refsp[spdiff]);
-                for(int k=0;k<IREGS;++k) fprintf(stderr,"[8]   R%d batched=%016llx ref=%016llx\n", k,
-                                      (unsigned long long)rOut[k][0], (unsigned long long)rf->r[k]);
             }
             if(chain+1<PC) rx_blake2b_default(tempHash, sizeof(tempHash), rf, sizeof(randomx::RegisterFile));
         }
