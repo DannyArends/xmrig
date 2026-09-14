@@ -994,6 +994,7 @@ static void runProgramFull(uint64_t rIn[IREGS][LANES],
 
 int verifyProgramFull()
 {
+    _mm_setcsr(0x9FC0);
     RandomX_CurrentConfig.Apply();
     printf("== BatchedVm Stage 6b: full real-program verify (vs executeBytecode) ==\n");
     const int PROGRAMS = 1000;

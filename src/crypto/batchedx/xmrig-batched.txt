@@ -1,0 +1,25 @@
+## Build Mining xmrig (MSYS2/mingw)
+git clone git@github.com:DannyArends/xmrig-batched.git /c/Github/xmrig-batched
+pacman -Syu
+pacman -S --needed git mingw-w64-x86_64-gcc make mingw-w64-x86_64-cmake mingw-w64-x86_64-pkg-config mingw-w64-x86_64-libuv mingw-w64-x86_64-hwloc mingw-w64-x86_64-openssl
+
+cd /c/Github/xmrig-batched
+rm -rf build
+mkdir build && cd build
+cmake .. -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+  -DWITH_RANDOMX=ON -DWITH_BATCHEDX=ON \
+  -DWITH_CN_LITE=OFF -DWITH_CN_HEAVY=OFF -DWITH_CN_PICO=OFF -DWITH_CN_FEMTO=OFF \
+  -DWITH_ARGON2=OFF -DWITH_KAWPOW=OFF -DWITH_GHOSTRIDER=OFF \
+  -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_NVML=OFF -DWITH_ADL=OFF \
+  -DWITH_HTTP=OFF -DWITH_ENV_VARS=OFF -DWITH_DMI=OFF \
+  -DWITH_BENCHMARK=OFF \
+  -DWITH_HWLOC=ON -DWITH_ASM=ON -DWITH_MSR=ON \
+  -DWITH_SSE4_1=ON -DWITH_AVX2=ON -DWITH_VAES=ON \
+  -DHWLOC_INCLUDE_DIR=/mingw64/include -DHWLOC_LIBRARY=/mingw64/lib/libhwloc.dll.a
+make -j$(nproc)
+
+## COPY DLLs
+cp $(ldd xmrig.exe | grep mingw64 | awk '{print $3}') .
+
+## $$$ profit $$$
+xmrig.exe --batchedx-verify
