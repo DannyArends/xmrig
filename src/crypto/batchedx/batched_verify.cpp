@@ -706,6 +706,52 @@ int verifyPerLaneMem()
     return fails==0?0:1;
 }
 
+// ---- Stage 12: per-lane float register programs vs 8 independent scalar runs ----
+int verifyPerLaneFloat()
+{
+    _mm_setcsr(0x9FC0);
+    printf("== BatchedVm Stage 12: per-lane float programs (8 different programs/lanes) ==\n");
+    rng_s = 0xD1B54A32D192ULL ^ 0x2BULL;
+    const int TRIALS = 20000;
+    const int PROGLEN = 256;
+    long fails = 0;
+
+    for (int t=0;t<TRIALS;++t){
+        static FInsn prog[LANES][PROGLEN];
+        for (int l=0;l<LANES;++l)
+            for (int i=0;i<PROGLEN;++i){ uint64_t r=rng(); prog[l][i].op=(FOp)(r%6); prog[l][i].dst=(r>>8)&3; prog[l][i].src=(r>>16)&3; }
+
+        BFReg batched[FREGS];
+        double scalar[LANES][FREGS][2];
+        for (int k=0;k<FREGS;++k){
+            double lo[LANES],hi[LANES];
+            for (int l=0;l<LANES;++l){
+                uint64_t r0=rng(), r1=rng();
+                double v0=1.0+(double)(r0&0xffffffff)/4294967296.0*1e6;
+                double v1=1.0+(double)(r1&0xffffffff)/4294967296.0*1e6;
+                lo[l]=v0; hi[l]=v1; scalar[l][k][0]=v0; scalar[l][k][1]=v1;
+            }
+            batched[k].lo=_mm512_loadu_pd(lo); batched[k].hi=_mm512_loadu_pd(hi);
+        }
+        static FInsn flat[LANES*PROGLEN];
+        for (int l=0;l<LANES;++l) for (int i=0;i<PROGLEN;++i) flat[l*PROGLEN+i]=prog[l][i];
+        runPerLaneFloat(batched, flat, PROGLEN);
+        for (int l=0;l<LANES;++l) scalarFloatProgram(scalar[l], prog[l], PROGLEN);
+
+        double blo[FREGS][LANES], bhi[FREGS][LANES];
+        for (int k=0;k<FREGS;++k){ _mm512_storeu_pd(blo[k],batched[k].lo); _mm512_storeu_pd(bhi[k],batched[k].hi); }
+        auto d2b=[](double x){uint64_t b;memcpy(&b,&x,8);return b;};
+        for (int l=0;l<LANES;++l)
+            for (int k=0;k<FREGS;++k){
+                if(d2b(blo[k][l])!=d2b(scalar[l][k][0])){ if(fails<8) printf("  MISMATCH trial %d lane %d F%d.lo\n",t,l,k); ++fails; }
+                if(d2b(bhi[k][l])!=d2b(scalar[l][k][1])){ if(fails<8) printf("  MISMATCH trial %d lane %d F%d.hi\n",t,l,k); ++fails; }
+            }
+    }
+    printf("== %s (%ld mismatches over %d trials x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, TRIALS, LANES);
+    return fails==0?0:1;
+}
+
 int verifyProgramFull()        { return verifyProgramFullImpl(false, "6b"); }
 int verifyProgramFullRounded() { return verifyProgramFullImpl(true,  "6c"); }
 

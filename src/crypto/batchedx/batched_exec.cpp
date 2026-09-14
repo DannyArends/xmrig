@@ -591,6 +591,41 @@ void runPerLaneMem(uint64_t regs[IREGS][LANES], const BInsn* prog, int count, ui
     for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)regs[k], r[k]);
 }
 
+// increment 4: per-lane float register ops. selectRegF/scatterRegF are the float
+// analog of selectReg — gather/scatter each lane's F[idx[lane]] (lo+hi) across the
+// FREGS float-register vectors.
+static inline BFReg selectRegF(const BFReg reg[FREGS], __m512i idx)
+{
+    BFReg sel = reg[0];
+    for (int k=1;k<FREGS;++k){ __mmask8 mk=_mm512_cmpeq_epi64_mask(idx,_mm512_set1_epi64(k));
+        sel.lo=_mm512_mask_mov_pd(sel.lo,mk,reg[k].lo); sel.hi=_mm512_mask_mov_pd(sel.hi,mk,reg[k].hi); }
+    return sel;
+}
+static inline void scatterRegF(BFReg reg[FREGS], __m512i idx, BFReg val, __mmask8 active)
+{
+    for (int k=0;k<FREGS;++k){ __mmask8 mk=active & _mm512_cmpeq_epi64_mask(idx,_mm512_set1_epi64(k));
+        reg[k].lo=_mm512_mask_mov_pd(reg[k].lo,mk,val.lo); reg[k].hi=_mm512_mask_mov_pd(reg[k].hi,mk,val.hi); }
+}
+
+void runPerLaneFloat(BFReg reg[FREGS], const FInsn* prog, int count)
+{
+    for (int pos=0; pos<count; ++pos) {
+        alignas(64) long long ov[LANES],dv[LANES],sv[LANES];
+        for (int l=0;l<LANES;++l){ const FInsn& in=prog[(size_t)l*count+pos]; ov[l]=in.op; dv[l]=in.dst; sv[l]=in.src; }
+        __m512i op=_mm512_loadu_si512(ov), dst=_mm512_loadu_si512(dv), src=_mm512_loadu_si512(sv);
+        auto OP=[&](FOp o){ return _mm512_cmpeq_epi64_mask(op,_mm512_set1_epi64((long long)o)); };
+
+        BFReg s=selectRegF(reg,src), d=selectRegF(reg,dst), nd=d;
+        { __mmask8 m=OP(F_FADD_R); nd.lo=_mm512_mask_add_pd(nd.lo,m,d.lo,s.lo); nd.hi=_mm512_mask_add_pd(nd.hi,m,d.hi,s.hi); }
+        { __mmask8 m=OP(F_FSUB_R); nd.lo=_mm512_mask_sub_pd(nd.lo,m,d.lo,s.lo); nd.hi=_mm512_mask_sub_pd(nd.hi,m,d.hi,s.hi); }
+        { __mmask8 m=OP(F_FMUL_R); nd.lo=_mm512_mask_mul_pd(nd.lo,m,d.lo,s.lo); nd.hi=_mm512_mask_mul_pd(nd.hi,m,d.hi,s.hi); }
+        { __mmask8 m=OP(F_FSQRT_R); nd.lo=_mm512_mask_sqrt_pd(nd.lo,m,emask(d.lo)); nd.hi=_mm512_mask_sqrt_pd(nd.hi,m,emask(d.hi)); }
+        { __mmask8 m=OP(F_FSCAL_R); nd.lo=_mm512_mask_mov_pd(nd.lo,m,fscal(d.lo)); nd.hi=_mm512_mask_mov_pd(nd.hi,m,fscal(d.hi)); }
+        { __mmask8 m=OP(F_FSWAP_R); nd.lo=_mm512_mask_mov_pd(nd.lo,m,d.hi); nd.hi=_mm512_mask_mov_pd(nd.hi,m,d.lo); }
+        scatterRegF(reg, dst, nd, (__mmask8)0xFF);
+    }
+}
+
 #if defined(__GNUC__)
 #   pragma GCC pop_options
 #endif
