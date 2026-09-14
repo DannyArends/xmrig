@@ -1,0 +1,414 @@
+/* XMRig — batched AVX-512 RandomX: self-test / verify drivers. */
+#include "crypto/batchedx/BatchedInternal.h"
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+
+namespace xmrig {
+namespace batchedx {
+
+static uint64_t rng_s;
+static inline uint64_t rng() { rng_s ^= rng_s << 13; rng_s ^= rng_s >> 7; rng_s ^= rng_s << 17; return rng_s; }
+
+static inline bool bothNaN(uint64_t a, uint64_t b) {
+    // exponent all ones + nonzero mantissa = NaN (ignore sign)
+    auto isnan = [](uint64_t x){ return ((x & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
+                                     && (x & 0x000fffffffffffffULL); };
+    return isnan(a) && isnan(b);
+}
+
+int verifyIntegerOps(){
+  printf("== BatchedVm Stage 1: integer ops verify ==\n");
+  rng_s = 0x9e3779b97f4a7c15ULL;
+
+  const int PROGRAMS = 20000;
+  const int PROGLEN  = 256;
+  int fails = 0;
+
+  for (int p = 0; p < PROGRAMS; ++p) {
+    // random program (integer register ops only)
+    BInsn prog[PROGLEN] = {};
+    for (int i = 0; i < PROGLEN; ++i) {
+      uint64_t r = rng();
+      prog[i].op  = (BOp)(r % 10);
+      prog[i].dst   = (r >> 8)  & 7;
+      prog[i].src   = (r >> 16) & 7;
+      prog[i].shift = (r >> 24) & 3;
+      prog[i].imm   = rng();
+    }
+
+    // random initial registers for 8 lanes
+    uint64_t batched[IREGS][LANES];
+    uint64_t scalar [LANES][IREGS];
+    for (int lane = 0; lane < LANES; ++lane)
+      for (int k = 0; k < IREGS; ++k) {
+        uint64_t v = rng();
+        scalar[lane][k]   = v;
+        batched[k][lane]  = v;
+      }
+
+    // run both
+    runIntegerProgram(batched, prog, PROGLEN);
+    for (int lane = 0; lane < LANES; ++lane)
+      scalarIntegerProgram(scalar[lane], prog, PROGLEN);
+
+    // diff
+    for (int lane = 0; lane < LANES; ++lane)
+      for (int k = 0; k < IREGS; ++k)
+        if (batched[k][lane] != scalar[lane][k]) {
+          if (fails < 5)
+            printf("  MISMATCH prog %d lane %d reg %d: batched %016llx scalar %016llx\n",
+                 p, lane, k,
+                 (unsigned long long)batched[k][lane],
+                 (unsigned long long)scalar[lane][k]);
+          ++fails;
+        }
+  }
+
+  printf("== %s (%d mismatches over %d programs x %d lanes) ==\n",
+       fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
+  return fails == 0 ? 0 : 1;
+}
+
+int verifyFloatOps()
+{
+    printf("== BatchedVm Stage 3: float ops verify ==\n");
+    rng_s = 0xd1b54a32d192 ^ 0x9e3779b97f4a7c15ULL;
+
+    const int PROGRAMS = 20000;
+    const int PROGLEN  = 256;
+    long fails = 0;
+
+    for (int p = 0; p < PROGRAMS; ++p) {
+        FInsn prog[PROGLEN];
+        for (int i = 0; i < PROGLEN; ++i) {
+            uint64_t r = rng();
+            prog[i].op  = (FOp)(r % 6);
+            prog[i].dst = (r >> 8)  & 3;
+            prog[i].src = (r >> 16) & 3;
+        }
+
+        // random finite doubles for 8 lanes x FREGS x 2
+        BFReg batched[FREGS];
+        double scalar[LANES][FREGS][2];
+        for (int k = 0; k < FREGS; ++k) {
+            double lo[LANES], hi[LANES];
+            for (int lane = 0; lane < LANES; ++lane) {
+                // build a finite double in a modest range to avoid inf/nan divergence noise
+                uint64_t r0 = rng(), r1 = rng();
+                double v0 = 1.0 + (double)(r0 & 0xffffffff) / 4294967296.0 * 1e6;
+                double v1 = 1.0 + (double)(r1 & 0xffffffff) / 4294967296.0 * 1e6;
+                lo[lane] = v0; hi[lane] = v1;
+                scalar[lane][k][0] = v0; scalar[lane][k][1] = v1;
+            }
+            batched[k].lo = _mm512_loadu_pd(lo);
+            batched[k].hi = _mm512_loadu_pd(hi);
+        }
+
+        runFloatProgram(batched, prog, PROGLEN);
+        for (int lane = 0; lane < LANES; ++lane)
+            scalarFloatProgram(scalar[lane], prog, PROGLEN);
+
+        // diff by raw bits (exact)
+        for (int k = 0; k < FREGS; ++k) {
+            double blo[LANES], bhi[LANES];
+            _mm512_storeu_pd(blo, batched[k].lo);
+            _mm512_storeu_pd(bhi, batched[k].hi);
+            for (int lane = 0; lane < LANES; ++lane) {
+                uint64_t xb, xs;
+                memcpy(&xb, &blo[lane], 8); memcpy(&xs, &scalar[lane][k][0], 8);
+                if (xb != xs && !bothNaN(xb, xs)) { if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d.lo\n", p, lane, k); ++fails; }
+                memcpy(&xb, &bhi[lane], 8); memcpy(&xs, &scalar[lane][k][1], 8);
+                if (xb != xs && !bothNaN(xb, xs)) { if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d.hi\n", p, lane, k); ++fails; }
+            }
+        }
+    }
+
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
+    return fails == 0 ? 0 : 1;
+}
+
+int verifyMemoryOps()
+{
+    printf("== BatchedVm Stage 4: memory ops verify ==\n");
+    rng_s = 0x243f6a8885a308d3ULL ^ 0x9e3779b97f4a7c15ULL;
+
+    const int PROGRAMS = 5000;      // fewer: each carries a scratchpad
+    const int PROGLEN  = 256;
+    // small scratchpad for the test (must be power-of-2 words). 64 KiB = 8192 words.
+    const uint64_t spWords = 8192;
+    const uint32_t spMaskBytes = (uint32_t)(spWords * 8 - 8); // 8-byte aligned mask
+    long fails = 0;
+
+    // batched: one contiguous block of LANES*spWords; scalar: LANES separate arrays
+    static uint64_t spB[LANES * 8192];
+    static uint64_t spS[LANES][8192];
+
+    // memory op set (indices into a small table)
+    static const BOp memops[7] = { B_IADD_M, B_ISUB_M, B_IMUL_M, B_IMULH_M, B_ISMULH_M, B_IXOR_M, B_ISTORE };
+
+    for (int p = 0; p < PROGRAMS; ++p) {
+        // random program of memory ops
+        BInsn prog[PROGLEN] = {};
+        for (int i = 0; i < PROGLEN; ++i) {
+            uint64_t r = rng();
+            prog[i].op      = memops[r % 7];
+            prog[i].dst     = (r >> 8)  & 7;
+            prog[i].src     = (r >> 16) & 7;
+            prog[i].shift   = 0;
+            prog[i].imm     = rng();
+            prog[i].memMask = spMaskBytes;   // fixed mask for the test scratchpad
+        }
+
+        // identical initial registers + scratchpads
+        uint64_t batched[IREGS][LANES];
+        uint64_t scalar [LANES][IREGS];
+        for (int lane = 0; lane < LANES; ++lane) {
+            for (int k = 0; k < IREGS; ++k) { uint64_t v = rng(); scalar[lane][k] = v; batched[k][lane] = v; }
+            for (uint64_t w = 0; w < spWords; ++w) { uint64_t v = rng(); spS[lane][w] = v; spB[lane*spWords + w] = v; }
+        }
+
+        runMemoryProgram(batched, prog, PROGLEN, spB, spWords);
+        for (int lane = 0; lane < LANES; ++lane)
+            scalarMemoryProgram(scalar[lane], prog, PROGLEN, spS[lane]);
+
+        // diff registers
+        for (int lane = 0; lane < LANES; ++lane)
+            for (int k = 0; k < IREGS; ++k)
+                if (batched[k][lane] != scalar[lane][k]) {
+                    if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d: b=%016llx s=%016llx\n",
+                        p, lane, k, (unsigned long long)batched[k][lane], (unsigned long long)scalar[lane][k]);
+                    ++fails;
+                }
+        // diff scratchpads (ISTORE writes)
+        for (int lane = 0; lane < LANES; ++lane)
+            for (uint64_t w = 0; w < spWords; ++w)
+                if (spB[lane*spWords + w] != spS[lane][w]) {
+                    if (fails < 5) printf("  MISMATCH prog %d lane %d sp[%llu]\n", p, lane, (unsigned long long)w);
+                    ++fails;
+                }
+    }
+
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
+    return fails == 0 ? 0 : 1;
+}
+
+int verifyBranchOps()
+{
+    printf("== BatchedVm Stage 5: branch (CBRANCH) verify ==\n");
+    rng_s = 0xb7e151628aed2a6bULL ^ 0x9e3779b97f4a7c15ULL;
+
+    const int PROGRAMS = 20000;
+    const int PROGLEN  = 256;
+    long fails = 0;
+
+    for (int p = 0; p < PROGRAMS; ++p) {
+        BInsn prog[PROGLEN] = {};
+        for (int i = 0; i < PROGLEN; ++i) {
+            uint64_t r = rng();
+            // ~10% CBRANCH, rest integer register ops (0..9)
+            if ((r % 10) == 0) {
+                prog[i].op      = B_CBRANCH;
+                prog[i].dst     = (r >> 8) & 7;
+                prog[i].imm     = rng();
+                // condition mask: a few bits high enough that "==0" is plausible but not
+                // always taken (mirrors RandomX ConditionMask placement)
+                prog[i].memMask = (uint32_t)(0xffU << 8);   // bits 8..15
+                prog[i].target  = (int16_t)(i > 0 ? (rng() % i) : 0);  // backward target
+                prog[i].src     = 0;
+                prog[i].shift   = 0;
+            } else {
+                prog[i].op      = (BOp)(r % 10);
+                prog[i].dst     = (r >> 8)  & 7;
+                prog[i].src     = (r >> 16) & 7;
+                prog[i].shift   = (r >> 24) & 3;
+                prog[i].imm     = rng();
+                prog[i].memMask = 0;
+                prog[i].target  = 0;
+            }
+        }
+
+        uint64_t batched[IREGS][LANES];
+        uint64_t scalar [LANES][IREGS];
+        for (int lane = 0; lane < LANES; ++lane)
+            for (int k = 0; k < IREGS; ++k) { uint64_t v = rng(); scalar[lane][k] = v; batched[k][lane] = v; }
+
+        runBranchProgram(batched, prog, PROGLEN);
+        for (int lane = 0; lane < LANES; ++lane)
+            scalarBranchProgram(scalar[lane], prog, PROGLEN);
+
+        for (int lane = 0; lane < LANES; ++lane)
+            for (int k = 0; k < IREGS; ++k)
+                if (batched[k][lane] != scalar[lane][k]) {
+                    if (fails < 5) printf("  MISMATCH prog %d lane %d reg %d: b=%016llx s=%016llx\n",
+                        p, lane, k, (unsigned long long)batched[k][lane], (unsigned long long)scalar[lane][k]);
+                    ++fails;
+                }
+    }
+
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails == 0 ? "ALL PASS" : "FAILURES", fails, PROGRAMS, LANES);
+    return fails == 0 ? 0 : 1;
+}
+
+int verifyProgram()
+{
+    RandomX_CurrentConfig.Apply();
+    printf("== BatchedVm Stage 6a: real-program int/branch verify ==\n");
+    const int PROGRAMS = 2000;
+    long fails = 0;
+    rng_s = 0xcafef00dd15ea5e5ULL ^ 0x9e3779b97f4a7c15ULL;
+    for (int p=0;p<PROGRAMS;++p) {
+        // real, valid program: random 64-byte seed -> AES fill (as the VM does)
+        alignas(16) uint8_t seed[64];
+        for (int i=0;i<64;++i) seed[i]=(uint8_t)rng();
+        randomx::Program program;
+        fillAes4Rx4<false>(seed, 128 + RandomX_CurrentConfig.ProgramSize * 8, &program);
+
+        randomx::NativeRegisterFile nreg;
+        static randomx::InstructionByteCode bytecode[512];
+        randomx::BytecodeMachine bm;
+
+        bm.compileProgram(program, bytecode, nreg);
+
+        // translate to BProg (int/branch ops; float/mem flagged not-ok = no-op here)
+        BProg bp; bp.count = (int)RandomX_CurrentConfig.ProgramSize;
+        for (int i=0;i<bp.count;++i) bp.ok[i] = translateInt(bytecode[i], nreg, bp.ins[i]);
+
+        // run batched (8 lanes) + scalar (8 lanes)
+        uint64_t batched[IREGS][LANES], scalar[LANES][IREGS];
+        for (int lane=0;lane<LANES;++lane)
+            for (int k=0;k<IREGS;++k){uint64_t v=rng();scalar[lane][k]=v;batched[k][lane]=v;}
+        runProgramIntBranch(batched, bp);
+        for (int lane=0;lane<LANES;++lane) scalarProgramIntBranch(scalar[lane], bp);
+
+        for (int lane=0;lane<LANES;++lane)
+            for (int k=0;k<IREGS;++k)
+                if (batched[k][lane]!=scalar[lane][k]) {
+                    if (fails<5) printf("  MISMATCH prog %d lane %d reg %d\n",p,lane,k);
+                    ++fails;
+                }
+    }
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, PROGRAMS, LANES);
+    return fails==0?0:1;
+}
+
+static int verifyProgramFullImpl(bool cfround, const char* stage)
+{
+    _mm_setcsr(0x9FC0);
+    RandomX_CurrentConfig.Apply();
+    printf("== BatchedVm Stage %s: full real-program verify%s ==\n",
+           stage, cfround ? " (per-lane CFROUND)" : " (vs executeBytecode)");
+    const int PROGRAMS = 1000;
+    // full RandomX scratchpad (2 MiB / lane) so the real memMask stays in bounds.
+    const uint64_t spWords = 2097152ull / 8;              // 262144 words = 2 MiB
+    long fails = 0;
+    rng_s = 0x2545F4914F6CDD1DULL ^ 0x9e3779b97f4a7c15ULL;
+
+    // heap-allocate: 8 x 2 MiB each (too large for static/stack)
+    uint64_t* spB   = (uint64_t*)malloc((size_t)LANES * spWords * 8);
+    uint64_t* spSnapFlat = (uint64_t*)malloc((size_t)LANES * spWords * 8);
+    if (!spB || !spSnapFlat) { printf("  6b: scratchpad alloc failed\n"); free(spB); free(spSnapFlat); return 1; }
+    auto SNAP = [&](int lane)->uint64_t* { return spSnapFlat + (size_t)lane*spWords; };
+
+    for (int p=0;p<PROGRAMS;++p) {
+        alignas(16) uint8_t seed[64]; for(int i=0;i<64;++i) seed[i]=(uint8_t)rng();
+        randomx::Program program;
+        fillAes4Rx4<false>(seed, 128 + RandomX_CurrentConfig.ProgramSize*8, &program);
+
+        randomx::NativeRegisterFile nregT;
+        static randomx::InstructionByteCode btT[512];
+        randomx::BytecodeMachine bmT; bmT.compileProgram(program, btT, nregT);
+
+        randomx::ProgramConfiguration cfg;
+        {
+            auto staticExp=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>(64-4))<<4; x<<=52; return x; };
+            auto floatMask=[&](uint64_t e){ return (e & ((1ULL<<22)-1)) | staticExp(e); };
+            cfg.eMask[0]=floatMask(program.getEntropy(14));
+            cfg.eMask[1]=floatMask(program.getEntropy(15));
+            cfg.readReg0=cfg.readReg1=cfg.readReg2=cfg.readReg3=0;
+        }
+
+        FullProg fp; fp.count=(int)RandomX_CurrentConfig.ProgramSize;
+        for (int i=0;i<fp.count;++i) translateFull(btT[i], nregT, fp.ins[i], cfround);
+
+        // ---- pristine input state (snapshot) ----
+        uint64_t rSnap[IREGS][LANES];
+        double fLo[8][LANES], fHi[8][LANES], aLo[4][LANES], aHi[4][LANES];
+        for (int lane=0; lane<LANES; ++lane) {
+            for (int k=0;k<IREGS;++k) rSnap[k][lane]=rng();
+            for (int k=0;k<8;++k){ fLo[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0;
+                                   fHi[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0; }
+            for (int k=0;k<4;++k){ aLo[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0;
+                                   aHi[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0; }
+            for (uint64_t w=0; w<spWords; ++w) SNAP(lane)[w]=rng();
+        }
+
+        // ---- batched run (copies of inputs) ----
+        uint64_t rB[IREGS][LANES];
+        for (int k=0;k<IREGS;++k) for(int l=0;l<LANES;++l) rB[k][l]=rSnap[k][l];
+        for (int lane=0; lane<LANES; ++lane)
+            for (uint64_t w=0; w<spWords; ++w) spB[lane*spWords+w]=SNAP(lane)[w];
+        BFReg Fb[8], Ab[4];
+        for (int k=0;k<8;++k){ Fb[k].lo=_mm512_loadu_pd(fLo[k]); Fb[k].hi=_mm512_loadu_pd(fHi[k]); }
+        for (int k=0;k<4;++k){ Ab[k].lo=_mm512_loadu_pd(aLo[k]); Ab[k].hi=_mm512_loadu_pd(aHi[k]); }
+        runProgramFull(rB, Fb, Ab, spB, spWords, cfg.eMask, fp);
+        // read back batched float f/e registers
+        double Fblo[8][LANES], Fbhi[8][LANES];
+        for (int k=0;k<8;++k){ _mm512_storeu_pd(Fblo[k],Fb[k].lo); _mm512_storeu_pd(Fbhi[k],Fb[k].hi); }
+
+        // ---- scalar ground truth per lane via executeBytecode ----
+        for (int lane=0; lane<LANES; ++lane) {
+            randomx::NativeRegisterFile nr;
+            static randomx::InstructionByteCode bt[512];
+            randomx::BytecodeMachine bm; bm.compileProgram(program, bt, nr);
+            if (!cfround)                                      // 6b neutralises CFROUND on both sides; 6c runs it for real
+                for (int i=0;i<fp.count;++i)
+                    if (bt[i].type==randomx::InstructionType::CFROUND) bt[i].type=randomx::InstructionType::NOP;
+            for (int k=0;k<IREGS;++k) nr.r[k]=rSnap[k][lane];
+            for (int k=0;k<randomx::RegisterCountFlt;++k){
+                double lo=fLo[k][lane], hi=fHi[k][lane];
+                nr.f[k]=_mm_set_pd(hi,lo);
+                double elo=fLo[k+4][lane], ehi=fHi[k+4][lane];
+                nr.e[k]=_mm_set_pd(ehi,elo);
+                nr.a[k]=_mm_set_pd(aHi[k][lane],aLo[k][lane]);
+            }
+            uint8_t* sp = reinterpret_cast<uint8_t*>(SNAP(lane));
+            rx_reset_float_state();                            // no rounding-mode leak lane->lane / prog->prog
+            randomx::BytecodeMachine::executeBytecode(bt, sp, cfg);
+
+            // diff integer regs
+            for (int k=0;k<IREGS;++k)
+                if (rB[k][lane]!=nr.r[k]) { if(fails<6) printf("  MISMATCH prog %d lane %d R%d\n",p,lane,k); ++fails; }
+            // diff float f/e regs (raw bits, NaN-equal)
+            auto cmpF=[&](int gidx, double blo, double bhi, rx_vec_f128 sv){
+                alignas(16) double s[2]; _mm_store_pd(s, sv);
+                uint64_t xb,xs;
+                memcpy(&xb,&blo,8); memcpy(&xs,&s[0],8);
+                bool n1=((xb&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xb&0xfffffffffffffULL);
+                bool n2=((xs&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xs&0xfffffffffffffULL);
+                if (xb!=xs && !(n1&&n2)) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.lo\n",p,lane,gidx); ++fails; }
+                memcpy(&xb,&bhi,8); memcpy(&xs,&s[1],8);
+                n1=((xb&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xb&0xfffffffffffffULL);
+                n2=((xs&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xs&0xfffffffffffffULL);
+                if (xb!=xs && !(n1&&n2)) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.hi\n",p,lane,gidx); ++fails; }
+            };
+            for (int k=0;k<randomx::RegisterCountFlt;++k) cmpF(k,    Fblo[k][lane],   Fbhi[k][lane],   nr.f[k]);
+            for (int k=0;k<randomx::RegisterCountFlt;++k) cmpF(k+4,  Fblo[k+4][lane], Fbhi[k+4][lane], nr.e[k]);
+        }
+    }
+
+    printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, PROGRAMS, LANES);
+    free(spB); free(spSnapFlat);
+    return fails==0?0:1;
+}
+
+int verifyProgramFull()        { return verifyProgramFullImpl(false, "6b"); }
+int verifyProgramFullRounded() { return verifyProgramFullImpl(true,  "6c"); }
+
+} // namespace batchedx
+} // namespace xmrig

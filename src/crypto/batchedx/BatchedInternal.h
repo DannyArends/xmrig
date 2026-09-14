@@ -1,0 +1,105 @@
+/* XMRig — batched AVX-512 RandomX: internal shared declarations.
+ * Types, inline helpers and cross-TU entry points shared by the batchedx
+ * translation units (translate / exec / ref / verify). Not a public API.
+ */
+#ifndef XMRIG_BATCHEDINTERNAL_H
+#define XMRIG_BATCHEDINTERNAL_H
+
+#include "crypto/batchedx/BatchedVm.h"
+#include "crypto/batchedx/BatchedOps.h"
+
+#include "crypto/randomx/bytecode_machine.hpp"
+#include "crypto/randomx/program.hpp"
+#include "crypto/randomx/aes_hash.hpp"
+
+namespace xmrig {
+namespace batchedx {
+
+static constexpr int FREGS = 4;   // RandomX f-group registers
+
+// ---- float op set (Stage 3 / float verify) ----
+enum FOp : uint8_t { F_FSWAP_R, F_FADD_R, F_FSUB_R, F_FMUL_R, F_FSQRT_R, F_FSCAL_R };
+struct FInsn { FOp op; uint8_t dst; uint8_t src; };   // dst/src index 0..FREGS-1
+
+// ---- translated-program containers ----
+struct BProg { BInsn ins[512]; bool ok[512]; int count; };
+enum FBOp : uint8_t { FB_NONE, FB_FSWAP, FB_FADD_R, FB_FSUB_R, FB_FMUL_R, FB_FSQRT_R,
+                      FB_FSCAL_R, FB_FADD_M, FB_FSUB_M, FB_FDIV_M };
+
+struct FullInsn {
+    uint8_t kind;   // 0=int/branch(ib), 1=float(fop), 2=skip, 3=cfround
+    BInsn   ib;
+    FBOp    fop;
+    uint8_t fdst;   // 0..7 (f=0..3, e=4..7)
+    uint8_t fsrc;   // a-group 0..3
+    uint8_t maddr;  // r-reg for float-M address
+    uint64_t fimm;
+    uint32_t fmask;
+};
+struct FullProg { FullInsn ins[512]; int count; };
+
+// ---- shared scalar / masked helpers (inline, one copy per TU) ----
+static inline uint64_t s_rotr(uint64_t x, unsigned c) { c &= 63; return c ? (x >> c) | (x << (64 - c)) : x; }
+static inline uint64_t s_rotl(uint64_t x, unsigned c) { c &= 63; return c ? (x << c) | (x >> (64 - c)) : x; }
+
+/** Scalar reference for one register-only integer op (IADD_RS..ISMULH_R, ISWAP_R). */
+static inline void applyScalarIntOp(uint64_t regs[IREGS], const BInsn& in, uint64_t s) {
+    uint64_t& d = regs[in.dst];
+    switch (in.op) {
+      case B_IADD_RS: d += (s << in.shift) + in.imm; break;
+      case B_ISUB_R:  d -= s; break;
+      case B_IMUL_R:  d *= s; break;
+      case B_INEG_R:  d = ~d + 1; break;
+      case B_IXOR_R:  d ^= s; break;
+      case B_IROR_R:  d = s_rotr(d, (unsigned)(s & 63)); break;
+      case B_IROL_R:  d = s_rotl(d, (unsigned)(s & 63)); break;
+      case B_ISWAP_R: if (in.dst != in.src) { uint64_t t = d; d = regs[in.src]; regs[in.src] = t; } break;
+      case B_IMULH_R:  d = (uint64_t)(((unsigned __int128)d * (unsigned __int128)s) >> 64); break;
+      case B_ISMULH_R: d = (uint64_t)(((__int128)(int64_t)d * (__int128)(int64_t)s) >> 64); break;
+      default: break;
+    }
+}
+
+static inline void applyIntMasked(__m512i r[IREGS], const BInsn& in, __mmask8 m)
+{
+    __m512i& d = r[in.dst];
+    const __m512i s = in.srcImm ? _mm512_set1_epi64((long long)in.srcVal) : r[in.src];
+    switch (in.op) {
+        case B_IADD_RS: d = _mm512_mask_add_epi64(d, m, d,
+                            _mm512_add_epi64(_mm512_slli_epi64(s, in.shift), _mm512_set1_epi64((long long)in.imm))); break;
+        case B_ISUB_R:  d = _mm512_mask_sub_epi64(d, m, d, s); break;
+        case B_IMUL_R:  d = _mm512_mask_mullo_epi64(d, m, d, s); break;
+        case B_INEG_R:  d = _mm512_mask_add_epi64(d, m, _mm512_xor_si512(d, _mm512_set1_epi64(-1)), _mm512_set1_epi64(1)); break;
+        case B_IXOR_R:  d = _mm512_mask_xor_epi64(d, m, d, s); break;
+        case B_IROR_R:  d = _mm512_mask_rorv_epi64(d, m, d, _mm512_and_si512(s, _mm512_set1_epi64(63))); break;
+        case B_IROL_R:  d = _mm512_mask_rolv_epi64(d, m, d, _mm512_and_si512(s, _mm512_set1_epi64(63))); break;
+        case B_IMULH_R: d = _mm512_mask_blend_epi64(m, d, mulhi_epu64(d, s)); break;
+        case B_ISMULH_R:d = _mm512_mask_blend_epi64(m, d, mulhi_epi64(d, s)); break;
+        case B_ISWAP_R: if (in.dst != in.src) {   // masked swap
+                            __m512i t = d;
+                            d          = _mm512_mask_blend_epi64(m, d, r[in.src]);
+                            r[in.src]  = _mm512_mask_blend_epi64(m, r[in.src], t);
+                        } break;
+        default: break;
+    }
+}
+
+// ---- cross-TU entry points ----
+void runMemoryProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count, uint64_t* sp, uint64_t spWords);
+void runBranchProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count);
+void runFloatProgram(BFReg reg[FREGS], const FInsn* prog, int count);
+void runProgramIntBranch(uint64_t regs[IREGS][LANES], const BProg& prog);
+void runProgramFull(uint64_t rIn[IREGS][LANES], BFReg F[8], const BFReg A[4], uint64_t* sp, uint64_t spWords, const uint64_t eMask[2], const FullProg& prog);
+void scalarIntegerProgram(uint64_t regs[IREGS], const BInsn* prog, int count);
+void scalarMemoryProgram(uint64_t regs[IREGS], const BInsn* prog, int count, uint64_t* sp);
+void scalarBranchProgram(uint64_t regs[IREGS], const BInsn* prog, int count);
+void scalarFloatProgram(double reg[FREGS][2], const FInsn* prog, int count);
+void scalarProgramIntBranch(uint64_t regs[IREGS], const BProg& prog);
+bool translateInt(const randomx::InstructionByteCode& ibc, const randomx::NativeRegisterFile& nreg, BInsn& out);
+bool translateMemInt(const randomx::InstructionByteCode& ibc, const randomx::NativeRegisterFile& nreg, BInsn& out);
+void translateFull(const randomx::InstructionByteCode& ibc, const randomx::NativeRegisterFile& nreg, FullInsn& out, bool cfround);
+
+} // namespace batchedx
+} // namespace xmrig
+
+#endif // XMRIG_BATCHEDINTERNAL_H
