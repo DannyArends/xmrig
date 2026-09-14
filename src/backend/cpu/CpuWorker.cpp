@@ -25,6 +25,7 @@
 #include "backend/cpu/CpuWorker.h"
 #include "base/tools/Alignment.h"
 #include "base/tools/Chrono.h"
+#include "base/io/log/Log.h"
 #include "core/config/Config.h"
 #include "core/Miner.h"
 #include "crypto/cn/CnCtx.h"
@@ -310,6 +311,8 @@ void xmrig::CpuWorker<N>::start()
                     for (size_t i = 0; i < N; ++i) { blobs[i] = m_job.blob() + i * job.size(); }
                     batchedx::batchedHash8(m_datasetRaw, reinterpret_cast<uint64_t*>(m_memory->scratchpad()),
                                            m_algorithm.l3() / 8, blobs, job.size(), m_hash);
+                    static bool batchedxOnce = [] { LOG_INFO("[batchedx] 8-wide AVX-512 RandomX active"); return true; }();
+                    (void) batchedxOnce;
                     if (!nextRound()) {
                         break;
                     }

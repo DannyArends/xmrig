@@ -185,7 +185,11 @@ public:
     inline size_t l2() const                                { return l2(m_id); }
     inline uint32_t family() const                          { return family(m_id); }
     inline uint32_t minIntensity() const                    { return ((m_id == GHOSTRIDER_RTM) ? 8 : 1); };
+#   ifdef XMRIG_FEATURE_BATCHEDX
+    inline uint32_t maxIntensity() const                    { return isCN() ? 5 : ((m_id == GHOSTRIDER_RTM || family() == RANDOM_X) ? 8 : 1); };
+#   else
     inline uint32_t maxIntensity() const                    { return isCN() ? 5 : ((m_id == GHOSTRIDER_RTM) ? 8 : 1); };
+#   endif
 
     inline size_t l3() const                                { return l3(m_id); }
 
