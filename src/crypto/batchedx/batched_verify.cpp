@@ -752,6 +752,96 @@ int verifyPerLaneFloat()
     return fails==0?0:1;
 }
 
+// ---- Stage 13: unified per-lane interpreter — 8 DIFFERENT programs vs 8x executeBytecode ----
+int verifyPerLaneFull()
+{
+    _mm_setcsr(0x9FC0);
+    RandomX_CurrentConfig.Apply();
+    printf("== BatchedVm Stage 13: unified per-lane interpreter (8 different programs) ==\n");
+    const int TRIALS = 200;
+    const int PS = (int)RandomX_CurrentConfig.ProgramSize;
+    const uint64_t spWords = RandomX_CurrentConfig.ScratchpadL3_Size / 8;
+    long fails = 0;
+    rng_s = 0x9E3779B97F4A7C15ULL ^ 0xF00DFACEULL;
+
+    uint64_t* spB=(uint64_t*)malloc((size_t)LANES*spWords*8);
+    uint64_t* spInit=(uint64_t*)malloc((size_t)LANES*spWords*8);
+    uint64_t* spS=(uint64_t*)malloc((size_t)spWords*8);
+    if(!spB||!spInit||!spS){ printf("  13: alloc failed\n"); free(spB); free(spInit); free(spS); return 1; }
+    auto floatMask=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>60)<<4; x<<=52; return (e&((1ULL<<22)-1))|x; };
+    auto d2b=[](double x){uint64_t b;memcpy(&b,&x,8);return b;};
+
+    for(int t=0;t<TRIALS;++t){
+        static FullProg fp[LANES];
+        static randomx::InstructionByteCode bt[LANES][512];
+        randomx::ProgramConfiguration cfg[LANES];
+        double aLo[4][LANES], aHi[4][LANES];
+        alignas(64) double emlo[LANES], emhi[LANES];
+        randomx::NativeRegisterFile nregT[LANES];
+
+        for(int l=0;l<LANES;++l){
+            alignas(16) uint8_t seed[64]; for(int i=0;i<64;++i) seed[i]=(uint8_t)rng();
+            randomx::Program program;
+            fillAes4Rx4<false>(seed, 128 + PS*8, &program);
+            randomx::BytecodeMachine bm; bm.compileProgram(program, bt[l], nregT[l]);
+            cfg[l].eMask[0]=floatMask(program.getEntropy(14));
+            cfg[l].eMask[1]=floatMask(program.getEntropy(15));
+            memcpy(&emlo[l],&cfg[l].eMask[0],8); memcpy(&emhi[l],&cfg[l].eMask[1],8);
+            fp[l].count=PS;
+            for(int i=0;i<PS;++i) translateFull(bt[l][i], nregT[l], fp[l].ins[i], true);
+            for(int k=0;k<4;++k){ aLo[k][l]=1.0+(double)(rng()&0xffffff)/16777216.0;
+                                  aHi[k][l]=1.0+(double)(rng()&0xffffff)/16777216.0; }
+        }
+
+        uint64_t rInit[IREGS][LANES];
+        double fInit[8][2][LANES];
+        static uint64_t spSnap[LANES][1]; (void)spSnap;
+        for(int l=0;l<LANES;++l) for(uint64_t w=0;w<spWords;++w){ uint64_t v=rng(); spB[l*spWords+w]=v; spInit[l*spWords+w]=v; }
+        for(int k=0;k<IREGS;++k) for(int l=0;l<LANES;++l) rInit[k][l]=rng();
+        for(int k=0;k<8;++k) for(int l=0;l<LANES;++l){
+            fInit[k][0][l]=1.0+(double)(rng()&0xffffff)/16777216.0;
+            fInit[k][1][l]=1.0+(double)(rng()&0xffffff)/16777216.0;
+        }
+
+        // batched
+        __m512i rV[IREGS]; for(int k=0;k<IREGS;++k) rV[k]=_mm512_loadu_si512((const void*)rInit[k]);
+        BFReg Fb[8]; for(int k=0;k<8;++k){ Fb[k].lo=_mm512_loadu_pd(fInit[k][0]); Fb[k].hi=_mm512_loadu_pd(fInit[k][1]); }
+        BFReg Ab[4]; for(int k=0;k<4;++k){ Ab[k].lo=_mm512_loadu_pd(aLo[k]); Ab[k].hi=_mm512_loadu_pd(aHi[k]); }
+        int rmode[LANES]; for(int l=0;l<LANES;++l) rmode[l]=0;
+        __m512d eLo=_mm512_loadu_pd(emlo), eHi=_mm512_loadu_pd(emhi);
+        runBytecodeVecPerLane(rV, Fb, Ab, spB, spWords, eLo, eHi, fp, rmode);
+        uint64_t rOut[IREGS][LANES]; for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rOut[k], rV[k]);
+        double Flo[8][LANES], Fhi[8][LANES];
+        for(int k=0;k<8;++k){ _mm512_storeu_pd(Flo[k],Fb[k].lo); _mm512_storeu_pd(Fhi[k],Fb[k].hi); }
+
+        // scalar per lane
+        for(int l=0;l<LANES;++l){
+            randomx::NativeRegisterFile nr;
+            randomx::BytecodeMachine bm; (void)bm;
+            // rebind bytecode to a fresh nr for this lane
+            for(int k=0;k<IREGS;++k) nregT[l].r[k]=rInit[k][l];
+            for(int k=0;k<4;++k){ nregT[l].f[k]=_mm_set_pd(fInit[k][1][l],fInit[k][0][l]);
+                                  nregT[l].e[k]=_mm_set_pd(fInit[k+4][1][l],fInit[k+4][0][l]);
+                                  nregT[l].a[k]=_mm_set_pd(aHi[k][l],aLo[k][l]); }
+            for(uint64_t w=0;w<spWords;++w) spS[w]=spInit[l*spWords+w];   // initial scratchpad
+            rx_reset_float_state();
+            randomx::BytecodeMachine::executeBytecode(bt[l], (uint8_t*)spS, cfg[l]);
+            for(int k=0;k<IREGS;++k) if(rOut[k][l]!=nregT[l].r[k]){ if(fails<8) printf("  MISMATCH trial %d lane %d R%d\n",t,l,k); ++fails; }
+            alignas(16) double s2[2];
+            for(int k=0;k<4;++k){ _mm_store_pd(s2,nregT[l].f[k]);
+                if(d2b(Flo[k][l])!=d2b(s2[0])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.lo\n",t,l,k);++fails;}
+                if(d2b(Fhi[k][l])!=d2b(s2[1])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.hi\n",t,l,k);++fails;} }
+            for(int k=0;k<4;++k){ _mm_store_pd(s2,nregT[l].e[k]);
+                if(d2b(Flo[k+4][l])!=d2b(s2[0])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.lo\n",t,l,k+4);++fails;}
+                if(d2b(Fhi[k+4][l])!=d2b(s2[1])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.hi\n",t,l,k+4);++fails;} }
+        }
+    }
+    free(spB); free(spInit); free(spS);
+    printf("== %s (%ld mismatches over %d trials x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, TRIALS, LANES);
+    return fails==0?0:1;
+}
+
 int verifyProgramFull()        { return verifyProgramFullImpl(false, "6b"); }
 int verifyProgramFullRounded() { return verifyProgramFullImpl(true,  "6c"); }
 

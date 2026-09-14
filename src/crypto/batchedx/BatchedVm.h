@@ -73,6 +73,7 @@ int verifyPerLaneInt();
 int verifyPerLaneBranch();
 int verifyPerLaneMem();
 int verifyPerLaneFloat();
+int verifyPerLaneFull();
 
 } // namespace batchedx
 
