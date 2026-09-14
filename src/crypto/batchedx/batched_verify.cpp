@@ -477,8 +477,10 @@ int verifyBatchedHash()
 
         alignas(16) uint64_t tempHash[8];
         rx_blake2b_default(tempHash, sizeof(tempHash), input, sizeof(input));
+        fprintf(stderr, "[8] initScratchpad\n");
         vm->initScratchpad(tempHash);
         vm->resetRoundingMode();
+        fprintf(stderr, "[8] batched scratchpad init\n");
 
         for(int lane=0;lane<LANES;++lane)
             fillAes1Rx4<false>(tempHash, spBytes, spB + (size_t)lane*spWords);
@@ -516,6 +518,7 @@ int verifyBatchedHash()
             for(int i=0;i<fp.count;++i) translateFull(btT[i], nregT, fp.ins[i], true);
 
             __m512i maV=_mm512_set1_epi64((long long)ma0), mxV=_mm512_set1_epi64((long long)mx0);
+            fprintf(stderr, "[8] chain %u: runBatchedExecute (dsoff=%llu)\n", chain, (unsigned long long)datasetOffset);
             runBatchedExecute(rV, Fb, Ab, spB, spWords, cfg.eMask, fp, maV, mxV,
                               (int)cfg.readReg0,(int)cfg.readReg1,(int)cfg.readReg2,(int)cfg.readReg3,
                               datasetOffset, ds, ~0ull, ITER, rmode);
