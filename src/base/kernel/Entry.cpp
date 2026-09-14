@@ -211,6 +211,7 @@ int xmrig::Entry::exec(const Process &process, Id id)
         rc |= batchedx::verifyBatchedHash();
         rc |= batchedx::verifyPerLaneInt();
         rc |= batchedx::verifyPerLaneBranch();
+        rc |= batchedx::verifyPerLaneMem();
         return rc;
     }
 #   endif

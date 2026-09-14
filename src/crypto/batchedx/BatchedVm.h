@@ -71,6 +71,7 @@ int verifyBatchedExecute();
 int verifyBatchedHash();
 int verifyPerLaneInt();
 int verifyPerLaneBranch();
+int verifyPerLaneMem();
 
 } // namespace batchedx
 

@@ -661,6 +661,51 @@ int verifyPerLaneBranch()
     return fails==0?0:1;
 }
 
+// ---- Stage 11: per-lane memory programs vs 8 independent scalar runs ----
+int verifyPerLaneMem()
+{
+    printf("== BatchedVm Stage 11: per-lane memory programs (8 different programs/lanes) ==\n");
+    rng_s = 0x243F6A8885A308D3ULL ^ 0x1BULL;
+    const int TRIALS = 5000;
+    const int PROGLEN = 256;
+    const uint64_t spWords = 8192;
+    const uint32_t spMaskBytes = (uint32_t)(spWords*8 - 8);
+    static const BOp memops[7] = { B_IADD_M, B_ISUB_M, B_IMUL_M, B_IMULH_M, B_ISMULH_M, B_IXOR_M, B_ISTORE };
+    long fails = 0;
+
+    uint64_t* spB=(uint64_t*)malloc((size_t)LANES*spWords*8);
+    static uint64_t spS[LANES][8192];
+    if(!spB){ printf("  11: alloc failed\n"); return 1; }
+
+    for (int t=0;t<TRIALS;++t){
+        static BInsn prog[LANES][PROGLEN];
+        for (int l=0;l<LANES;++l)
+            for (int i=0;i<PROGLEN;++i){
+                uint64_t r=rng();
+                prog[l][i].op=memops[r%7]; prog[l][i].dst=(r>>8)&7; prog[l][i].src=(r>>16)&7;
+                prog[l][i].shift=0; prog[l][i].imm=rng(); prog[l][i].memMask=spMaskBytes;
+                prog[l][i].target=0; prog[l][i].srcImm=false; prog[l][i].srcVal=0;
+            }
+        uint64_t batched[IREGS][LANES]; uint64_t scalar[LANES][IREGS];
+        for (int l=0;l<LANES;++l){
+            for (int k=0;k<IREGS;++k){ uint64_t v=rng(); scalar[l][k]=v; batched[k][l]=v; }
+            for (uint64_t w=0;w<spWords;++w){ uint64_t v=rng(); spS[l][w]=v; spB[l*spWords+w]=v; }
+        }
+        static BInsn flat[LANES*PROGLEN];
+        for (int l=0;l<LANES;++l) for (int i=0;i<PROGLEN;++i) flat[l*PROGLEN+i]=prog[l][i];
+        runPerLaneMem(batched, flat, PROGLEN, spB, spWords);
+        for (int l=0;l<LANES;++l) scalarMemoryProgram(scalar[l], prog[l], PROGLEN, spS[l]);
+
+        for (int l=0;l<LANES;++l)
+            for (int k=0;k<IREGS;++k)
+                if (batched[k][l]!=scalar[l][k]){ if(fails<8) printf("  MISMATCH trial %d lane %d R%d\n",t,l,k); ++fails; }
+    }
+    free(spB);
+    printf("== %s (%ld mismatches over %d trials x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, TRIALS, LANES);
+    return fails==0?0:1;
+}
+
 int verifyProgramFull()        { return verifyProgramFullImpl(false, "6b"); }
 int verifyProgramFullRounded() { return verifyProgramFullImpl(true,  "6c"); }
 

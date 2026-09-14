@@ -550,6 +550,47 @@ void runPerLaneIntBranch(uint64_t regs[IREGS][LANES], const BInsn* prog, int cou
     for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)regs[k], r[k]);
 }
 
+// increment 3: per-lane memory ops (loads + ISTORE), each lane its own scratchpad.
+void runPerLaneMem(uint64_t regs[IREGS][LANES], const BInsn* prog, int count, uint64_t* sp, uint64_t spWords)
+{
+    __m512i r[IREGS];
+    for (int k=0;k<IREGS;++k) r[k]=_mm512_loadu_si512((const void*)regs[k]);
+    const __m512i laneBase = _mm512_set_epi64(
+        (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
+        (long long)(3*spWords),(long long)(2*spWords),(long long)(1*spWords),0LL);
+
+    for (int pos=0; pos<count; ++pos) {
+        alignas(64) long long ov[LANES],dv[LANES],sv[LANES],iv[LANES],mmv[LANES];
+        for (int l=0;l<LANES;++l){ const BInsn& ib=prog[(size_t)l*count+pos];
+            ov[l]=ib.op; dv[l]=ib.dst; sv[l]=ib.src; iv[l]=(long long)ib.imm; mmv[l]=(long long)(uint64_t)ib.memMask; }
+        __m512i op=_mm512_loadu_si512(ov), dst=_mm512_loadu_si512(dv), src=_mm512_loadu_si512(sv),
+                imm=_mm512_loadu_si512(iv), mask=_mm512_loadu_si512(mmv);
+        auto OP=[&](BOp o){ return _mm512_cmpeq_epi64_mask(op,_mm512_set1_epi64((long long)o)); };
+
+        __m512i s=selectReg(r,src), d=selectReg(r,dst);
+        __mmask8 stm=OP(B_ISTORE), ldm=(__mmask8)(~stm);
+
+        __m512i addrS=_mm512_and_si512(_mm512_add_epi64(d,imm),mask);
+        __m512i widxS=_mm512_add_epi64(_mm512_srli_epi64(addrS,3),laneBase);
+        _mm512_mask_i64scatter_epi64((long long*)sp, stm, widxS, s, 8);
+
+        __m512i addrL=_mm512_and_si512(_mm512_add_epi64(s,imm),mask);
+        __m512i widxL=_mm512_add_epi64(_mm512_srli_epi64(addrL,3),laneBase);
+        __m512i v=_mm512_mask_i64gather_epi64(_mm512_setzero_si512(), ldm, widxL, (const long long*)sp, 8);
+
+        __m512i nd=d;
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IADD_M),  _mm512_add_epi64(d,v));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_ISUB_M),  _mm512_sub_epi64(d,v));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IMUL_M),  _mm512_mullo_epi64(d,v));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IMULH_M), mulhi_epu64(d,v));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_ISMULH_M),mulhi_epi64(d,v));
+        nd=_mm512_mask_mov_epi64(nd, OP(B_IXOR_M),  _mm512_xor_si512(d,v));
+        scatterReg(r, dst, nd, ldm);
+    }
+
+    for (int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)regs[k], r[k]);
+}
+
 #if defined(__GNUC__)
 #   pragma GCC pop_options
 #endif
