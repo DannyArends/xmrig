@@ -786,7 +786,7 @@ enum FBOp : uint8_t { FB_NONE, FB_FSWAP, FB_FADD_R, FB_FSUB_R, FB_FMUL_R, FB_FSQ
                       FB_FSCAL_R, FB_FADD_M, FB_FSUB_M, FB_FDIV_M };
 
 struct FullInsn {
-    uint8_t kind;   // 0=int/branch(ib), 1=float(fop), 2=skip
+    uint8_t kind;   // 0=int/branch(ib), 1=float(fop), 2=skip, 3=cfround
     BInsn   ib;
     FBOp    fop;
     uint8_t fdst;   // 0..7 (f=0..3, e=4..7)
@@ -797,7 +797,7 @@ struct FullInsn {
 };
 
 static void translateFull(const randomx::InstructionByteCode& ibc,
-                          const randomx::NativeRegisterFile& nreg, FullInsn& out)
+                          const randomx::NativeRegisterFile& nreg, FullInsn& out, bool cfround)
 {
     using IT = randomx::InstructionType;
     auto fidx = [&](const void* p)->int {
@@ -821,7 +821,10 @@ static void translateFull(const randomx::InstructionByteCode& ibc,
         case IT::FADD_M:  out.kind=1; out.fop=FB_FADD_M; out.fdst=(uint8_t)fidx(ibc.fdst); out.maddr=(uint8_t)(ibc.isrc-&nreg.r[0]); return;
         case IT::FSUB_M:  out.kind=1; out.fop=FB_FSUB_M; out.fdst=(uint8_t)fidx(ibc.fdst); out.maddr=(uint8_t)(ibc.isrc-&nreg.r[0]); return;
         case IT::FDIV_M:  out.kind=1; out.fop=FB_FDIV_M; out.fdst=(uint8_t)fidx(ibc.fdst); out.maddr=(uint8_t)(ibc.isrc-&nreg.r[0]); return;
-        case IT::CFROUND: out.kind=2; return;
+        case IT::CFROUND:
+            if (cfround) { out.kind=3; out.maddr=(uint8_t)(ibc.isrc-&nreg.r[0]); out.fimm=ibc.imm; }
+            else          out.kind=2;
+            return;
         case IT::NOP:     out.kind=2; return;
         default:
             if (translateInt(ibc, nreg, out.ib)) { out.kind=0; return; }
@@ -869,6 +872,7 @@ static void runProgramFull(uint64_t rIn[IREGS][LANES],
     const __m512d mantMask = _mm512_castsi512_pd(_mm512_set1_epi64((long long)E_MANTISSA_MASK));
 
     int pc[LANES]; for(int l=0;l<LANES;++l) pc[l]=0;
+    int rmode[LANES]; for(int l=0;l<LANES;++l) rmode[l]=0;   // per-lane RandomX rounding mode (0=RN)
     long steps=0, maxSteps=(long)prog.count*64*LANES;
     for(;;){
         int pos=prog.count;
@@ -879,6 +883,16 @@ static void runProgramFull(uint64_t rIn[IREGS][LANES],
         const FullInsn& fi = prog.ins[pos];
 
         if (fi.kind==2) { for(int l=0;l<LANES;++l) if(pc[l]==pos)++pc[l]; continue; }
+
+        if (fi.kind==3) {                                   // CFROUND: per-lane rounding-mode update
+            uint64_t rv[LANES]; _mm512_storeu_si512(rv, r[fi.maddr]);
+            for(int l=0;l<LANES;++l) if(pc[l]==pos){
+                uint64_t v=s_rotr(rv[l],(unsigned)fi.fimm);
+                if((v&60)==0) rmode[l]=(int)(v&3);          // Tweak_V2_CFROUND gate; mode = v&3
+                ++pc[l];
+            }
+            continue;
+        }
 
         if (fi.kind==0) {
             const BInsn& in = fi.ib;
@@ -933,41 +947,48 @@ static void runProgramFull(uint64_t rIn[IREGS][LANES],
         // kind==1 : float op
         {
             BFReg& d = F[fi.fdst];
-            switch (fi.fop) {
-                case FB_FSWAP: {
-                    __m512d tl=_mm512_mask_blend_pd(m,d.lo,d.hi);
-                    __m512d th=_mm512_mask_blend_pd(m,d.hi,d.lo);
-                    d.lo=tl; d.hi=th; break;
-                }
-                case FB_FADD_R: { const BFReg& s=A[fi.fsrc];
-                    d.lo=_mm512_mask_add_pd(d.lo,m,d.lo,s.lo); d.hi=_mm512_mask_add_pd(d.hi,m,d.hi,s.hi); break; }
-                case FB_FSUB_R: { const BFReg& s=A[fi.fsrc];
-                    d.lo=_mm512_mask_sub_pd(d.lo,m,d.lo,s.lo); d.hi=_mm512_mask_sub_pd(d.hi,m,d.hi,s.hi); break; }
-                case FB_FMUL_R: { const BFReg& s=A[fi.fsrc];
-                    d.lo=_mm512_mask_mul_pd(d.lo,m,d.lo,s.lo); d.hi=_mm512_mask_mul_pd(d.hi,m,d.hi,s.hi); break; }
-                case FB_FSQRT_R:
-                    d.lo=_mm512_mask_sqrt_pd(d.lo,m,d.lo); d.hi=_mm512_mask_sqrt_pd(d.hi,m,d.hi); break;
-                case FB_FSCAL_R:
-                    d.lo=_mm512_mask_blend_pd(m,d.lo,fscal(d.lo)); d.hi=_mm512_mask_blend_pd(m,d.hi,fscal(d.hi)); break;
-                case FB_FADD_M: case FB_FSUB_M: case FB_FDIV_M: {
+            if (fi.fop==FB_FSWAP) {                          // rounding-independent
+                __m512d tl=_mm512_mask_blend_pd(m,d.lo,d.hi);
+                __m512d th=_mm512_mask_blend_pd(m,d.hi,d.lo);
+                d.lo=tl; d.hi=th;
+            } else if (fi.fop==FB_FSCAL_R) {                 // rounding-independent (bit flip)
+                d.lo=_mm512_mask_blend_pd(m,d.lo,fscal(d.lo)); d.hi=_mm512_mask_blend_pd(m,d.hi,fscal(d.hi));
+            } else {
+                // rounding-sensitive: resolve operand once, then apply per-lane mode in <=4 masked passes
+                __m512d slo=_mm512_setzero_pd(), shi=_mm512_setzero_pd();
+                if (fi.fop==FB_FADD_R||fi.fop==FB_FSUB_R||fi.fop==FB_FMUL_R) {
+                    const BFReg& s=A[fi.fsrc]; slo=s.lo; shi=s.hi;
+                } else if (fi.fop==FB_FADD_M||fi.fop==FB_FSUB_M||fi.fop==FB_FDIV_M) {
                     __m512i addr=_mm512_and_si512(_mm512_add_epi64(r[fi.maddr],_mm512_set1_epi64((long long)fi.fimm)),
                                                   _mm512_set1_epi64((long long)(uint64_t)fi.fmask));
                     __m512i widx=_mm512_add_epi64(_mm512_srli_epi64(addr,3),laneBase);
                     __m512i w=_mm512_i64gather_epi64(widx,(const long long*)sp,8);
-                    __m512d slo,shi; cvtPackedIntPD(w,slo,shi);
-                    if (fi.fop==FB_FDIV_M) {
-                        // maskRegisterExponentMantissa: (x & mant) | eMask
+                    cvtPackedIntPD(w,slo,shi);
+                    if (fi.fop==FB_FDIV_M) {                 // maskRegisterExponentMantissa: (x & mant) | eMask
                         slo=_mm512_or_pd(_mm512_and_pd(slo,mantMask),eMaskLo);
                         shi=_mm512_or_pd(_mm512_and_pd(shi,mantMask),eMaskHi);
-                        d.lo=_mm512_mask_div_pd(d.lo,m,d.lo,slo); d.hi=_mm512_mask_div_pd(d.hi,m,d.hi,shi);
-                    } else if (fi.fop==FB_FADD_M) {
-                        d.lo=_mm512_mask_add_pd(d.lo,m,d.lo,slo); d.hi=_mm512_mask_add_pd(d.hi,m,d.hi,shi);
-                    } else {
-                        d.lo=_mm512_mask_sub_pd(d.lo,m,d.lo,slo); d.hi=_mm512_mask_sub_pd(d.hi,m,d.hi,shi);
                     }
-                    break;
                 }
-                default: break;
+                __mmask8 sub[4]={0,0,0,0};
+                for(int l=0;l<LANES;++l) if(pc[l]==pos) sub[rmode[l]]|=(__mmask8)(1u<<l);
+                for(int md=0;md<4;++md){
+                    if(!sub[md]) continue;
+                    _mm_setcsr(0x9FC0u|((unsigned)md<<13));
+                    __mmask8 sm=sub[md];
+                    switch(fi.fop){
+                        case FB_FADD_R: case FB_FADD_M:
+                            d.lo=_mm512_mask_add_pd(d.lo,sm,d.lo,slo); d.hi=_mm512_mask_add_pd(d.hi,sm,d.hi,shi); break;
+                        case FB_FSUB_R: case FB_FSUB_M:
+                            d.lo=_mm512_mask_sub_pd(d.lo,sm,d.lo,slo); d.hi=_mm512_mask_sub_pd(d.hi,sm,d.hi,shi); break;
+                        case FB_FMUL_R:
+                            d.lo=_mm512_mask_mul_pd(d.lo,sm,d.lo,slo); d.hi=_mm512_mask_mul_pd(d.hi,sm,d.hi,shi); break;
+                        case FB_FDIV_M:
+                            d.lo=_mm512_mask_div_pd(d.lo,sm,d.lo,slo); d.hi=_mm512_mask_div_pd(d.hi,sm,d.hi,shi); break;
+                        case FB_FSQRT_R:
+                            d.lo=_mm512_mask_sqrt_pd(d.lo,sm,d.lo); d.hi=_mm512_mask_sqrt_pd(d.hi,sm,d.hi); break;
+                        default: break;
+                    }
+                }
             }
             for(int l=0;l<LANES;++l) if(pc[l]==pos)++pc[l];
         }
@@ -975,11 +996,12 @@ static void runProgramFull(uint64_t rIn[IREGS][LANES],
     for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rIn[k], r[k]);
 }
 
-int verifyProgramFull()
+static int verifyProgramFullImpl(bool cfround, const char* stage)
 {
     _mm_setcsr(0x9FC0);
     RandomX_CurrentConfig.Apply();
-    printf("== BatchedVm Stage 6b: full real-program verify (vs executeBytecode) ==\n");
+    printf("== BatchedVm Stage %s: full real-program verify%s ==\n",
+           stage, cfround ? " (per-lane CFROUND)" : " (vs executeBytecode)");
     const int PROGRAMS = 1000;
     // full RandomX scratchpad (2 MiB / lane) so the real memMask stays in bounds.
     const uint64_t spWords = 2097152ull / 8;              // 262144 words = 2 MiB
@@ -1011,7 +1033,7 @@ int verifyProgramFull()
         }
 
         FullProg fp; fp.count=(int)RandomX_CurrentConfig.ProgramSize;
-        for (int i=0;i<fp.count;++i) translateFull(btT[i], nregT, fp.ins[i]);
+        for (int i=0;i<fp.count;++i) translateFull(btT[i], nregT, fp.ins[i], cfround);
 
         // ---- pristine input state (snapshot) ----
         uint64_t rSnap[IREGS][LANES];
@@ -1043,8 +1065,9 @@ int verifyProgramFull()
             randomx::NativeRegisterFile nr;
             static randomx::InstructionByteCode bt[512];
             randomx::BytecodeMachine bm; bm.compileProgram(program, bt, nr);
-            for (int i=0;i<fp.count;++i)                       // batched side defers CFROUND; neutralise on oracle too
-                if (bt[i].type==randomx::InstructionType::CFROUND) bt[i].type=randomx::InstructionType::NOP;
+            if (!cfround)                                      // 6b neutralises CFROUND on both sides; 6c runs it for real
+                for (int i=0;i<fp.count;++i)
+                    if (bt[i].type==randomx::InstructionType::CFROUND) bt[i].type=randomx::InstructionType::NOP;
             for (int k=0;k<IREGS;++k) nr.r[k]=rSnap[k][lane];
             for (int k=0;k<randomx::RegisterCountFlt;++k){
                 double lo=fLo[k][lane], hi=fHi[k][lane];
@@ -1083,5 +1106,8 @@ int verifyProgramFull()
     free(spB); free(spSnapFlat);
     return fails==0?0:1;
 }
+
+int verifyProgramFull()        { return verifyProgramFullImpl(false, "6b"); }
+int verifyProgramFullRounded() { return verifyProgramFullImpl(true,  "6c"); }
 } // namespace batchedx
 } // namespace xmrig

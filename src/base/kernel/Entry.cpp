@@ -205,6 +205,7 @@ int xmrig::Entry::exec(const Process &process, Id id)
         rc |= batchedx::verifyBranchOps();
         rc |= batchedx::verifyProgram();
         rc |= batchedx::verifyProgramFull();
+        rc |= batchedx::verifyProgramFullRounded();
         return rc;
     }
 #   endif
