@@ -10,6 +10,7 @@
 #include <immintrin.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include "crypto/randomx/bytecode_machine.hpp"
 #include "crypto/randomx/program.hpp"
 #include "crypto/randomx/aes_hash.hpp"
@@ -996,13 +997,16 @@ int verifyProgramFull()
     RandomX_CurrentConfig.Apply();
     printf("== BatchedVm Stage 6b: full real-program verify (vs executeBytecode) ==\n");
     const int PROGRAMS = 1000;
-    const uint64_t spWords = 8192;
-    const uint32_t spMaskBytes = (uint32_t)(spWords*8 - 8); (void)spMaskBytes;
+    // full RandomX scratchpad (2 MiB / lane) so the real memMask stays in bounds.
+    const uint64_t spWords = 2097152ull / 8;              // 262144 words = 2 MiB
     long fails = 0;
     rng_s = 0x2545F4914F6CDD1DULL ^ 0x9e3779b97f4a7c15ULL;
 
-    static uint64_t spSnap[LANES][8192];   // pristine scratchpad input per lane
-    static uint64_t spB[LANES*8192];        // batched working scratchpad
+    // heap-allocate: 8 x 2 MiB each (too large for static/stack)
+    uint64_t* spB   = (uint64_t*)malloc((size_t)LANES * spWords * 8);
+    uint64_t* spSnapFlat = (uint64_t*)malloc((size_t)LANES * spWords * 8);
+    if (!spB || !spSnapFlat) { printf("  6b: scratchpad alloc failed\n"); free(spB); free(spSnapFlat); return 1; }
+    auto SNAP = [&](int lane)->uint64_t* { return spSnapFlat + (size_t)lane*spWords; };
 
     for (int p=0;p<PROGRAMS;++p) {
         alignas(16) uint8_t seed[64]; for(int i=0;i<64;++i) seed[i]=(uint8_t)rng();
@@ -1034,14 +1038,14 @@ int verifyProgramFull()
                                    fHi[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0; }
             for (int k=0;k<4;++k){ aLo[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0;
                                    aHi[k][lane]=1.0+(double)(rng()&0xffffff)/16777216.0; }
-            for (uint64_t w=0; w<spWords; ++w) spSnap[lane][w]=rng();
+            for (uint64_t w=0; w<spWords; ++w) SNAP(lane)[w]=rng();
         }
 
         // ---- batched run (copies of inputs) ----
         uint64_t rB[IREGS][LANES];
         for (int k=0;k<IREGS;++k) for(int l=0;l<LANES;++l) rB[k][l]=rSnap[k][l];
         for (int lane=0; lane<LANES; ++lane)
-            for (uint64_t w=0; w<spWords; ++w) spB[lane*spWords+w]=spSnap[lane][w];
+            for (uint64_t w=0; w<spWords; ++w) spB[lane*spWords+w]=SNAP(lane)[w];
         BFReg Fb[8], Ab[4];
         for (int k=0;k<8;++k){ Fb[k].lo=_mm512_loadu_pd(fLo[k]); Fb[k].hi=_mm512_loadu_pd(fHi[k]); }
         for (int k=0;k<4;++k){ Ab[k].lo=_mm512_loadu_pd(aLo[k]); Ab[k].hi=_mm512_loadu_pd(aHi[k]); }
@@ -1063,7 +1067,7 @@ int verifyProgramFull()
                 nr.e[k]=_mm_set_pd(ehi,elo);
                 nr.a[k]=_mm_set_pd(aHi[k][lane],aLo[k][lane]);
             }
-            uint8_t* sp = reinterpret_cast<uint8_t*>(spSnap[lane]);
+            uint8_t* sp = reinterpret_cast<uint8_t*>(SNAP(lane));
             randomx::BytecodeMachine::executeBytecode(bt, sp, cfg);
 
             // diff integer regs
@@ -1089,6 +1093,7 @@ int verifyProgramFull()
 
     printf("== %s (%ld mismatches over %d programs x %d lanes) ==\n",
            fails==0?"ALL PASS":"FAILURES", fails, PROGRAMS, LANES);
+    free(spB); free(spSnapFlat);
     return fails==0?0:1;
 }
 } // namespace batchedx
