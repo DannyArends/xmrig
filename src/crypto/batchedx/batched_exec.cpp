@@ -356,7 +356,7 @@ void runBatchedExecute(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
                        __m512i& ma, __m512i& mx,
                        int rr0, int rr1, int rr2, int rr3,
                        uint64_t datasetOffset, const uint64_t* dataset, uint64_t dmask,
-                       uint32_t iterations)
+                       uint32_t iterations, int rmode[LANES])
 {
     const __m512i laneBase = _mm512_set_epi64(
         (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
@@ -369,8 +369,6 @@ void runBatchedExecute(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
     const __m512i dmaskv   = _mm512_set1_epi64((long long)dmask);
     const __m512i lo32     = _mm512_set1_epi64(0xFFFFFFFFll);
     const bool prefetchTweak = RandomX_CurrentConfig.Tweak_V2_PREFETCH;
-
-    int rmode[LANES]; for(int l=0;l<LANES;++l) rmode[l]=0;   // reset once per program
 
     __m512i spAddr0 = mx;
     __m512i spAddr1 = ma;

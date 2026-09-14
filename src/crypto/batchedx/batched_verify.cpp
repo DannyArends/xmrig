@@ -1,5 +1,13 @@
 /* XMRig — batched AVX-512 RandomX: self-test / verify drivers. */
 #include "crypto/batchedx/BatchedInternal.h"
+#include "crypto/randomx/randomx.h"
+#include "crypto/randomx/virtual_machine.hpp"
+#include "crypto/randomx/blake2/blake2.h"
+#include "crypto/rx/RxDataset.h"
+#include "crypto/rx/RxVm.h"
+#include "crypto/rx/RxConfig.h"
+#include "crypto/common/Assembly.h"
+#include "base/tools/Buffer.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -407,6 +415,134 @@ static int verifyProgramFullImpl(bool cfround, const char* stage)
     return fails==0?0:1;
 }
 
+// ---- Stage 8 (skeleton): full batched hash vs a real full-mem reference VM ----
+// Drives the reference chain-by-chain (run()+getRegisterFile()) and mirrors it
+// batched, comparing the register file after EVERY program so a divergence
+// localizes to the first bad chain; final 32-byte hash compared at the end.
+// Heavy: builds the real FastMode (~2 GiB) dataset via xmrig Rx (run locally).
+int verifyBatchedHash()
+{
+    _mm_setcsr(0x9FC0);
+    RandomX_CurrentConfig.Apply();
+    printf("== BatchedVm Stage 8: full batched hash (vs randomx_calculate_hash) ==\n");
+
+    const uint32_t ITER    = RandomX_CurrentConfig.ProgramIterations;
+    const uint32_t PC      = RandomX_CurrentConfig.ProgramCount;
+    const uint64_t spBytes = RandomX_CurrentConfig.ScratchpadL3_Size;
+    const uint64_t spWords = spBytes / 8;
+    const int NHASH = 2;
+    long fails = 0;
+
+    const char* key = "batchedx-stage8";
+    Buffer seed; seed.assign((const uint8_t*)key, (const uint8_t*)key + strlen(key));
+    RxDataset dataset(false, false, true, RxConfig::FastMode, 0);
+    if(!dataset.get()){ printf("  8: dataset alloc failed (FastMode needs ~2GiB)\n"); return 1; }
+    printf("  8: initialising FastMode dataset (may take a while)...\n");
+    dataset.init(seed, 1, 0);
+    randomx_vm* vm = RxVm::create(&dataset, nullptr, true, Assembly(), 0);
+    if(!vm){ printf("  8: vm create failed\n"); return 1; }
+    const uint64_t* ds = (const uint64_t*)randomx_get_dataset_memory(dataset.get());
+
+    uint64_t* spB = (uint64_t*)malloc((size_t)LANES*spWords*8);
+    if(!spB){ printf("  8: scratchpad alloc failed\n"); RxVm::destroy(vm); return 1; }
+
+    auto getSmallPos=[](uint64_t e)->uint64_t{ uint64_t exp=e>>59, man=e&((1ULL<<52)-1); exp+=1023; exp&=2047; exp<<=52; return exp|man; };
+    auto bits2d=[](uint64_t b)->double{ double d; memcpy(&d,&b,8); return d; };
+    auto d2bits=[](double d)->uint64_t{ uint64_t b; memcpy(&b,&d,8); return b; };
+
+    for(int n=0; n<NHASH; ++n){
+        alignas(16) uint64_t input[8]; for(int i=0;i<8;++i) input[i]=0x9e3779b97f4a7c15ULL*(uint64_t)(n+1)+(uint64_t)i;
+
+        alignas(16) uint64_t tempHash[8];
+        rx_blake2b_default(tempHash, sizeof(tempHash), input, sizeof(input));
+        vm->initScratchpad(tempHash);
+        vm->resetRoundingMode();
+
+        for(int lane=0;lane<LANES;++lane)
+            fillAes1Rx4<false>(tempHash, spBytes, spB + (size_t)lane*spWords);
+        randomx::RegisterFile* r0 = vm->getRegisterFile();
+        __m512i rV[IREGS];
+        for(int k=0;k<IREGS;++k) rV[k]=_mm512_set1_epi64((long long)r0->r[k]);
+        BFReg Fb[8]; for(int k=0;k<8;++k){ Fb[k].lo=_mm512_setzero_pd(); Fb[k].hi=_mm512_setzero_pd(); }
+        int rmode[LANES]; for(int l=0;l<LANES;++l) rmode[l]=0;
+
+        for(uint32_t chain=0; chain<PC; ++chain){
+            randomx::Program program;
+            fillAes4Rx4<false>(tempHash, 128 + RandomX_CurrentConfig.ProgramSize*8, &program);
+            randomx::NativeRegisterFile nregT;
+            static randomx::InstructionByteCode btT[512];
+            randomx::BytecodeMachine bmT; bmT.compileProgram(program, btT, nregT);
+
+            randomx::ProgramConfiguration cfg;
+            auto staticExp=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>(64-4))<<4; x<<=52; return x; };
+            auto floatMask=[&](uint64_t e){ return (e & ((1ULL<<22)-1)) | staticExp(e); };
+            cfg.eMask[0]=floatMask(program.getEntropy(14));
+            cfg.eMask[1]=floatMask(program.getEntropy(15));
+            uint64_t ar=program.getEntropy(12);
+            cfg.readReg0=0+(ar&1); ar>>=1; cfg.readReg1=2+(ar&1); ar>>=1;
+            cfg.readReg2=4+(ar&1); ar>>=1; cfg.readReg3=6+(ar&1);
+            const uint32_t ma0=(uint32_t)(program.getEntropy(8) & CacheLineAlignMask);
+            const uint32_t mx0=(uint32_t)(program.getEntropy(10));
+            const uint64_t datasetOffset=(program.getEntropy(13) % (DatasetExtraItems+1)) * randomx::CacheLineSize;
+
+            BFReg Ab[4];
+            for(int k=0;k<4;++k){
+                Ab[k].lo=_mm512_set1_pd(bits2d(getSmallPos(program.getEntropy(2*k))));
+                Ab[k].hi=_mm512_set1_pd(bits2d(getSmallPos(program.getEntropy(2*k+1))));
+            }
+            FullProg fp; fp.count=(int)RandomX_CurrentConfig.ProgramSize;
+            for(int i=0;i<fp.count;++i) translateFull(btT[i], nregT, fp.ins[i], true);
+
+            __m512i maV=_mm512_set1_epi64((long long)ma0), mxV=_mm512_set1_epi64((long long)mx0);
+            runBatchedExecute(rV, Fb, Ab, spB, spWords, cfg.eMask, fp, maV, mxV,
+                              (int)cfg.readReg0,(int)cfg.readReg1,(int)cfg.readReg2,(int)cfg.readReg3,
+                              datasetOffset, ds, ~0ull, ITER, rmode);
+
+            vm->run(tempHash);
+            randomx::RegisterFile* rf = vm->getRegisterFile();
+
+            uint64_t rOut[IREGS][LANES]; for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rOut[k], rV[k]);
+            double Fblo[8][LANES], Fbhi[8][LANES];
+            for(int k=0;k<8;++k){ _mm512_storeu_pd(Fblo[k],Fb[k].lo); _mm512_storeu_pd(Fbhi[k],Fb[k].hi); }
+            for(int lane=0;lane<LANES;++lane){
+                for(int k=0;k<IREGS;++k)
+                    if(rOut[k][lane]!=rf->r[k]){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d R%d\n",n,chain,lane,k); ++fails; }
+                for(int k=0;k<4;++k){
+                    if(d2bits(Fblo[k][lane])!=d2bits(rf->f[k].lo)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.lo\n",n,chain,lane,k); ++fails; }
+                    if(d2bits(Fbhi[k][lane])!=d2bits(rf->f[k].hi)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.hi\n",n,chain,lane,k); ++fails; }
+                    if(d2bits(Fblo[k+4][lane])!=d2bits(rf->e[k].lo)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.lo\n",n,chain,lane,k+4); ++fails; }
+                    if(d2bits(Fbhi[k+4][lane])!=d2bits(rf->e[k].hi)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.hi\n",n,chain,lane,k+4); ++fails; }
+                }
+            }
+
+            if(chain+1<PC) rx_blake2b_default(tempHash, sizeof(tempHash), rf, sizeof(randomx::RegisterFile));
+        }
+
+        alignas(16) uint8_t refOut[32];
+        vm->getFinalResult(refOut);
+
+        uint64_t rOut[IREGS][LANES]; for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rOut[k], rV[k]);
+        double Fblo[8][LANES], Fbhi[8][LANES];
+        for(int k=0;k<8;++k){ _mm512_storeu_pd(Fblo[k],Fb[k].lo); _mm512_storeu_pd(Fbhi[k],Fb[k].hi); }
+        for(int lane=0;lane<LANES;++lane){
+            randomx::RegisterFile rfl; memset(&rfl,0,sizeof(rfl));
+            for(int k=0;k<IREGS;++k) rfl.r[k]=rOut[k][lane];
+            for(int k=0;k<4;++k){ rfl.f[k].lo=Fblo[k][lane]; rfl.f[k].hi=Fbhi[k][lane];
+                                  rfl.e[k].lo=Fblo[k+4][lane]; rfl.e[k].hi=Fbhi[k+4][lane]; }
+            hashAes1Rx4<false>(spB + (size_t)lane*spWords, spBytes, &rfl.a);
+            alignas(16) uint8_t out[32];
+            rx_blake2b_default(out, 32, &rfl, sizeof(randomx::RegisterFile));
+            if(memcmp(out, refOut, 32)!=0){ if(fails<8) printf("  MISMATCH hash %d lane %d final\n",n,lane); ++fails; }
+        }
+    }
+
+    free(spB);
+    RxVm::destroy(vm);
+    printf("== %s (%ld mismatches over %d hashes x %d lanes) ==\n",
+           fails==0?"ALL PASS":"FAILURES", fails, NHASH, LANES);
+    return fails==0?0:1;
+}
+
 int verifyProgramFull()        { return verifyProgramFullImpl(false, "6b"); }
 int verifyProgramFullRounded() { return verifyProgramFullImpl(true,  "6c"); }
 
@@ -482,9 +618,10 @@ int verifyBatchedExecute()
         __m512i maV=_mm512_set1_epi64((long long)ma0), mxV=_mm512_set1_epi64((long long)mx0);
         __m512i rV[IREGS];
         for(int k=0;k<IREGS;++k) rV[k]=_mm512_loadu_si512((const void*)rB[k]);
+        int rmode[LANES]; for(int l=0;l<LANES;++l) rmode[l]=0;
         runBatchedExecute(rV, Fb, Ab, spB, spWords, cfg.eMask, fp, maV, mxV,
                           (int)cfg.readReg0,(int)cfg.readReg1,(int)cfg.readReg2,(int)cfg.readReg3,
-                          datasetOffset, ds, dmask, ITER);
+                          datasetOffset, ds, dmask, ITER, rmode);
         for(int k=0;k<IREGS;++k) _mm512_storeu_si512((void*)rB[k], rV[k]);
         double Fblo[8][LANES], Fbhi[8][LANES];
         for(int k=0;k<8;++k){ _mm512_storeu_pd(Fblo[k],Fb[k].lo); _mm512_storeu_pd(Fbhi[k],Fb[k].hi); }
