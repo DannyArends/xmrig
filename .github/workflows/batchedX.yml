@@ -1,0 +1,40 @@
+# .github/workflows/batchedX.yml
+name: batchedX
+on:
+  push:
+    branches: [batched-avx512]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check runner has AVX-512F
+        run: |
+          echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2)"
+          if ! grep -qm1 avx512f /proc/cpuinfo; then
+            echo "::warning::This runner has no AVX-512F. Re-run the job to reroll onto another VM."
+            echo "no_avx512=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential libuv1-dev libhwloc-dev libssl-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DWITH_RANDOMX=ON -DWITH_BATCHEDX=ON \
+            -DWITH_CN_LITE=OFF -DWITH_CN_HEAVY=OFF -DWITH_CN_PICO=OFF -DWITH_CN_FEMTO=OFF \
+            -DWITH_ARGON2=OFF -DWITH_KAWPOW=OFF -DWITH_GHOSTRIDER=OFF \
+            -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_NVML=OFF -DWITH_ADL=OFF \
+            -DWITH_HTTP=OFF -DWITH_ENV_VARS=OFF -DWITH_DMI=OFF -DWITH_BENCHMARK=OFF \
+            -DWITH_HWLOC=ON -DWITH_ASM=ON -DWITH_MSR=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run batched verify
+        if: env.no_avx512 != '1'
+        run: ./build/xmrig --batchedx-verify

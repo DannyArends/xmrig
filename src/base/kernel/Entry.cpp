@@ -40,6 +40,7 @@
 
 #ifdef XMRIG_FEATURE_BATCHEDX
 #   include "crypto/batchedx/BatchedVm.h"
+#   include "backend/cpu/Cpu.h"
 #endif
 
 #include "base/kernel/Entry.h"
@@ -194,6 +195,10 @@ int xmrig::Entry::exec(const Process &process, Id id)
 #   ifdef XMRIG_FEATURE_BATCHEDX
     case BatchedxVerify:
     {
+        if (!Cpu::info()->has(ICpuInfo::FLAG_AVX512F)) {
+            printf("batchedx: this CPU has no AVX-512F; batched verify needs an AVX-512 machine.\n");
+            return 1;
+        }
         int rc = batchedx::verifyIntegerOps();
         rc |= batchedx::verifyFloatOps();
         rc |= batchedx::verifyMemoryOps();
