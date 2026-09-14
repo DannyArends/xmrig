@@ -29,7 +29,8 @@ static Stage8Ctx stage8_setup()
     if (!dataset.get()) { printf("  8: dataset alloc failed (FastMode needs ~2GiB)\n"); return c; }
     if (!inited) { fprintf(stderr, "[8] init dataset...\n"); bool ok = dataset.init(seed, 1, 0); fprintf(stderr, "[8] init=%d\n", ok); inited = true; }
     fprintf(stderr, "[8] create vm...\n");
-    c.vm = RxVm::create(&dataset, nullptr, true, Assembly(), 0);
+    static uint8_t* refScratch = (uint8_t*)aligned_alloc(4096, (size_t)RandomX_CurrentConfig.ScratchpadL3_Size);
+    c.vm = RxVm::create(&dataset, refScratch, false /*hardware AES; matches batched fillAes<false>*/, Assembly(), 0);
     fprintf(stderr, "[8] vm=%p\n", (void*)c.vm);
     c.ds = (const uint64_t*)randomx_get_dataset_memory(dataset.get());
     fprintf(stderr, "[8] ds=%p\n", (void*)c.ds);
@@ -522,6 +523,7 @@ int verifyBatchedHash()
             runBatchedExecute(rV, Fb, Ab, spB, spWords, cfg.eMask, fp, maV, mxV,
                               (int)cfg.readReg0,(int)cfg.readReg1,(int)cfg.readReg2,(int)cfg.readReg3,
                               datasetOffset, ds, ~0ull, ITER, rmode);
+            fprintf(stderr, "[8] chain %u: vm->run\n", chain);
 
             vm->run(tempHash);
             randomx::RegisterFile* rf = vm->getRegisterFile();
