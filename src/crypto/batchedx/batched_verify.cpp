@@ -17,20 +17,21 @@ namespace batchedx {
 
 // [default target] all std::vector / xmrig Rx work lives here, OUTSIDE the AVX-512
 // pragma region, so the vector allocator is never instantiated under a target mismatch.
-struct Stage8Ctx { randomx_vm* vm; const uint64_t* ds; };
+struct Stage8Ctx { randomx_vm* vm; const uint64_t* ds; uint8_t* scratch; };
 static Stage8Ctx stage8_setup()
 {
     static const char* key = "batchedx-stage8";
     static Buffer seed((const uint8_t*)key, (const uint8_t*)key + strlen(key));
     static RxDataset dataset(false, false, true, RxConfig::FastMode, 0);
     static bool inited = false;
-    Stage8Ctx c{ nullptr, nullptr };
+    Stage8Ctx c{ nullptr, nullptr, nullptr };
     fprintf(stderr, "[8] ctor: dataset=%p cache=%p\n", (void*)dataset.get(), (void*)dataset.cache());
     if (!dataset.get()) { printf("  8: dataset alloc failed (FastMode needs ~2GiB)\n"); return c; }
     if (!inited) { fprintf(stderr, "[8] init dataset...\n"); bool ok = dataset.init(seed, 1, 0); fprintf(stderr, "[8] init=%d\n", ok); inited = true; }
     fprintf(stderr, "[8] create vm...\n");
     static uint8_t* refScratch = (uint8_t*)aligned_alloc(4096, (size_t)RandomX_CurrentConfig.ScratchpadL3_Size);
     c.vm = RxVm::create(&dataset, refScratch, false /*hardware AES; matches batched fillAes<false>*/, Assembly(), 0);
+    c.scratch = refScratch;
     fprintf(stderr, "[8] vm=%p\n", (void*)c.vm);
     c.ds = (const uint64_t*)randomx_get_dataset_memory(dataset.get());
     fprintf(stderr, "[8] ds=%p\n", (void*)c.ds);
@@ -541,7 +542,15 @@ int verifyBatchedHash()
                     if(d2bits(Fbhi[k+4][lane])!=d2bits(rf->e[k].hi)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.hi\n",n,chain,lane,k+4); ++fails; }
                 }
             }
-
+            if(n==0 && chain==0){
+                const uint64_t* refsp = (const uint64_t*)ctx.scratch;
+                long spdiff=-1; for(uint64_t w=0; w<spWords; ++w) if(spB[w]!=refsp[w]){ spdiff=(long)w; break; }
+                fprintf(stderr,"[8] chain0 scratchpad firstDiffWord=%ld (spWords=%llu)\n", spdiff, (unsigned long long)spWords);
+                if(spdiff>=0) fprintf(stderr,"[8]   sp[%ld] batched=%016llx ref=%016llx\n", spdiff,
+                                      (unsigned long long)spB[spdiff], (unsigned long long)refsp[spdiff]);
+                for(int k=0;k<IREGS;++k) fprintf(stderr,"[8]   R%d batched=%016llx ref=%016llx\n", k,
+                                      (unsigned long long)rOut[k][0], (unsigned long long)rf->r[k]);
+            }
             if(chain+1<PC) rx_blake2b_default(tempHash, sizeof(tempHash), rf, sizeof(randomx::RegisterFile));
         }
 
