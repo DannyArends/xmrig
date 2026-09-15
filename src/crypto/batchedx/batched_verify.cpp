@@ -764,6 +764,21 @@ void batchedHash8(const uint64_t* dataset, uint64_t* spB, uint64_t spWords,
     }
 }
 
+// ---- mining hook: owns the batched-path decision + blob gather. Returns true if it
+// computed the N hashes (caller submits from `out`), false if the caller should fall
+// back to the JIT path. Keeps CpuWorker's edit to a single call. ----
+bool batchedMine(size_t N, const uint64_t* dataset, uint8_t* scratchpad, size_t l3,
+                 const uint8_t* blob, size_t blobSize, bool hasMinerSig, uint8_t* out)
+{
+    if (N != LANES || dataset == nullptr || hasMinerSig || RandomX_CurrentConfig.Tweak_V2_COMMITMENT) {
+        return false;
+    }
+    const void* blobs[LANES];
+    for (size_t i = 0; i < LANES; ++i) { blobs[i] = blob + i * blobSize; }
+    batchedHash8(dataset, reinterpret_cast<uint64_t*>(scratchpad), (uint64_t)(l3 / 8), blobs, blobSize, out);
+    return true;
+}
+
 // ---- Stage 14: full per-lane hash — 8 DIFFERENT nonces vs 8x randomx_calculate_hash ----
 int verifyPerLaneHash()
 {

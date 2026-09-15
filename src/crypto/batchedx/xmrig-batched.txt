@@ -1,9 +1,9 @@
 ## Build Mining xmrig (MSYS2/mingw)
-git clone git@github.com:DannyArends/xmrig-batched.git /c/Github/xmrig-batched
+git clone git@github.com:DannyArends/xmrig.git /c/Github/xmrig
 pacman -Syu
 pacman -S --needed git mingw-w64-x86_64-gcc make mingw-w64-x86_64-cmake mingw-w64-x86_64-pkg-config mingw-w64-x86_64-libuv mingw-w64-x86_64-hwloc mingw-w64-x86_64-openssl
 
-cd /c/Github/xmrig-batched
+cd /c/Github/xmrig
 rm -rf build
 mkdir build && cd build
 cmake .. -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
@@ -21,11 +21,11 @@ make -j$(nproc)
 ## COPY DLLs
 cp $(ldd xmrig.exe | grep mingw64 | awk '{print $3}') .
 
-## $$$ profit $$$
+## Run verification
 xmrig.exe --batchedx-verify
 
 
-cd ~/Github/xmrig-batched
+cd ~/Github/xmrig
 rm -rf build
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release \
@@ -38,3 +38,6 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
   -DWITH_HWLOC=ON -DWITH_ASM=ON -DWITH_MSR=ON \
   -DWITH_SSE4_1=ON -DWITH_AVX2=ON -DWITH_VAES=ON
 make -j$(nproc)
+
+## Run verification
+xmrig.exe --batchedx-verify

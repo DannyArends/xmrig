@@ -72,6 +72,7 @@ int verifyBatchedHash();
 int verifyPerLaneFull();
 int verifyPerLaneHash();
 void batchedHash8(const uint64_t* dataset, uint64_t* spB, uint64_t spWords, const void* const* blobs, size_t inputSize, uint8_t* out);
+bool batchedMine(size_t N, const uint64_t* dataset, uint8_t* scratchpad, size_t l3, const uint8_t* blob, size_t blobSize, bool hasMinerSig, uint8_t* out);
 
 } // namespace batchedx
 
