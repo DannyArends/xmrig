@@ -1,7 +1,25 @@
-/* XMRig batched RandomX — reusable AVX-512 op primitives (header, inline).
+/* XMRig batched RandomX - reusable AVX-512 op primitives (header, inline)
  * No behaviour change: these are the same helpers previously local to BatchedVm.cpp,
  * exposed here so all batched translation units share them.
+ *
+ * Copyright 2018-2020 SChernykh    <https://github.com/SChernykh>
+ * Copyright 2016-2020 XMRig        <https://github.com/xmrig>, <support@xmrig.com>
+ * Copyright (c) 2026  Danny Arends <https://github.com/DannyArends>
+ *
+ *   This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
+
 #ifndef XMRIG_BATCHEDOPS_H
 #define XMRIG_BATCHEDOPS_H
 
