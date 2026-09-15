@@ -6,7 +6,7 @@ namespace batchedx {
 
 #if defined(__GNUC__)
 #   pragma GCC push_options
-#   pragma GCC target("avx512f,avx512dq,tune=znver4")
+#   pragma GCC target("avx512f,avx512dq,tune=native")
 #endif
 
 void runIntegerProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count){
@@ -570,7 +570,7 @@ void runBytecodeVecPerLane(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
         }
         // write back integer results (all kInt lanes except pure-store; store lanes' nd==d so harmless)
         scatterReg(r, dst, nd, kInt);
-        if (swm) scatterReg(r, src, d, swm);   // ISWAP writeback only when a lane needs it
+        scatterReg(r, src, d,  swm);
 
         // ---- float (kind==1) ----
         if(kFloat){

@@ -41,7 +41,7 @@ struct FullProg { FullInsn ins[512]; int count; };
 // ---- shared scalar / masked helpers (inline, one copy per TU) ----
 #if defined(__GNUC__)
 #   pragma GCC push_options
-#   pragma GCC target("avx512f,avx512dq,tune=znver4")
+#   pragma GCC target("avx512f,avx512dq,tune=native")
 #endif
 static inline uint64_t s_rotr(uint64_t x, unsigned c) { c &= 63; return c ? (x >> c) | (x << (64 - c)) : x; }
 static inline uint64_t s_rotl(uint64_t x, unsigned c) { c &= 63; return c ? (x << c) | (x >> (64 - c)) : x; }

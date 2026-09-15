@@ -98,9 +98,6 @@ private:
 
 #   ifdef XMRIG_ALGO_RANDOMX
     randomx_vm *m_vm        = nullptr;
-#   ifdef XMRIG_FEATURE_BATCHEDX
-    const uint64_t *m_datasetRaw = nullptr;
-#   endif
     Buffer m_seed;
 #   endif
 
