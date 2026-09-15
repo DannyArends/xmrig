@@ -76,6 +76,33 @@ static inline __m512i makeLaneBase(uint64_t spWords) {
 /** Set MXCSR to the RandomX default with rounding mode (0..3) applied. */
 static inline void setRoundingMode(int mode) { _mm_setcsr(kMxcsrDefault | ((unsigned)mode << 13)); }
 
+/** Bit-cast between a double and its raw 64-bit representation. */
+static inline double   bitsToDouble(uint64_t b) { double d; memcpy(&d, &b, 8); return d; }
+static inline uint64_t doubleToBits(double d)   { uint64_t b; memcpy(&b, &d, 8); return b; }
+
+/** RandomX getSmallPositiveFloatBits: a small positive double drawn from entropy. */
+static inline uint64_t getSmallPositiveFloatBits(uint64_t e) {
+    uint64_t exp = e >> 59, man = e & ((1ULL<<52)-1);
+    exp += 1023; exp &= 2047; exp <<= 52;
+    return exp | man;
+}
+
+/** RandomX e-register exponent/mantissa mask derived from entropy (eMask). */
+static inline uint64_t floatMaskBits(uint64_t e) {
+    uint64_t x = 0x300; x |= (e >> 60) << 4; x <<= 52;
+    return (e & ((1ULL<<22)-1)) | x;
+}
+
+/** True if the raw bits encode a NaN (max exponent, non-zero mantissa). */
+static inline bool isNaNBits(uint64_t x) {
+    return ((x & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL) && (x & 0xfffffffffffffULL);
+}
+/** Bit-exact double compare, treating any two NaNs as equal (RandomX allows NaN payload drift). */
+static inline bool floatBitsEqualOrNaN(double a, double b) {
+    uint64_t xa = doubleToBits(a), xb = doubleToBits(b);
+    return xa == xb || (isNaNBits(xa) && isNaNBits(xb));
+}
+
 /** Scalar reference for one register-only integer op (IADD_RS..ISMULH_R, ISWAP_R). */
 static inline void applyScalarIntOp(uint64_t regs[IREGS], const BInsn& in, uint64_t s) {
     uint64_t& d = regs[in.dst];

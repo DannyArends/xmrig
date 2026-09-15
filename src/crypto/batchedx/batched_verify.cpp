@@ -381,10 +381,8 @@ static int verifyProgramFullImpl(bool cfround, const char* stage)
 
         randomx::ProgramConfiguration cfg;
         {
-            auto staticExp=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>(64-4))<<4; x<<=52; return x; };
-            auto floatMask=[&](uint64_t e){ return (e & ((1ULL<<22)-1)) | staticExp(e); };
-            cfg.eMask[0]=floatMask(program.getEntropy(14));
-            cfg.eMask[1]=floatMask(program.getEntropy(15));
+            cfg.eMask[0]=floatMaskBits(program.getEntropy(14));
+            cfg.eMask[1]=floatMaskBits(program.getEntropy(15));
             cfg.readReg0=cfg.readReg1=cfg.readReg2=cfg.readReg3=0;
         }
 
@@ -442,15 +440,8 @@ static int verifyProgramFullImpl(bool cfround, const char* stage)
             // diff float f/e regs (raw bits, NaN-equal)
             auto cmpF=[&](int gidx, double blo, double bhi, rx_vec_f128 sv){
                 alignas(16) double s[2]; _mm_store_pd(s, sv);
-                uint64_t xb,xs;
-                memcpy(&xb,&blo,8); memcpy(&xs,&s[0],8);
-                bool n1=((xb&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xb&0xfffffffffffffULL);
-                bool n2=((xs&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xs&0xfffffffffffffULL);
-                if (xb!=xs && !(n1&&n2)) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.lo\n",p,lane,gidx); ++fails; }
-                memcpy(&xb,&bhi,8); memcpy(&xs,&s[1],8);
-                n1=((xb&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xb&0xfffffffffffffULL);
-                n2=((xs&0x7ff0000000000000ULL)==0x7ff0000000000000ULL)&&(xs&0xfffffffffffffULL);
-                if (xb!=xs && !(n1&&n2)) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.hi\n",p,lane,gidx); ++fails; }
+                if (!floatBitsEqualOrNaN(blo, s[0])) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.lo\n",p,lane,gidx); ++fails; }
+                if (!floatBitsEqualOrNaN(bhi, s[1])) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.hi\n",p,lane,gidx); ++fails; }
             };
             for (int k=0;k<randomx::RegisterCountFlt;++k) cmpF(k,    Fblo[k][lane],   Fbhi[k][lane],   nr.f[k]);
             for (int k=0;k<randomx::RegisterCountFlt;++k) cmpF(k+4,  Fblo[k+4][lane], Fbhi[k+4][lane], nr.e[k]);
@@ -489,9 +480,6 @@ int verifyBatchedHash()
     uint64_t* spB = (uint64_t*)malloc((size_t)LANES*spWords*8);
     if(!spB){ printf("  8: scratchpad alloc failed\n"); stage8_teardown(vm); return 1; }
 
-    auto getSmallPos=[](uint64_t e)->uint64_t{ uint64_t exp=e>>59, man=e&((1ULL<<52)-1); exp+=1023; exp&=2047; exp<<=52; return exp|man; };
-    auto bits2d=[](uint64_t b)->double{ double d; memcpy(&d,&b,8); return d; };
-    auto d2bits=[](double d)->uint64_t{ uint64_t b; memcpy(&b,&d,8); return b; };
 
     for(int n=0; n<NHASH; ++n){
         alignas(16) uint64_t input[8]; for(int i=0;i<8;++i) input[i]=0x9e3779b97f4a7c15ULL*(uint64_t)(n+1)+(uint64_t)i;
@@ -527,10 +515,8 @@ int verifyBatchedHash()
             randomx::BytecodeMachine bmT; bmT.compileProgram(program, btT, nregT);
 
             randomx::ProgramConfiguration cfg;
-            auto staticExp=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>(64-4))<<4; x<<=52; return x; };
-            auto floatMask=[&](uint64_t e){ return (e & ((1ULL<<22)-1)) | staticExp(e); };
-            cfg.eMask[0]=floatMask(program.getEntropy(14));
-            cfg.eMask[1]=floatMask(program.getEntropy(15));
+            cfg.eMask[0]=floatMaskBits(program.getEntropy(14));
+            cfg.eMask[1]=floatMaskBits(program.getEntropy(15));
             uint64_t ar=program.getEntropy(12);
             cfg.readReg0=0+(ar&1); ar>>=1; cfg.readReg1=2+(ar&1); ar>>=1;
             cfg.readReg2=4+(ar&1); ar>>=1; cfg.readReg3=6+(ar&1);
@@ -540,8 +526,8 @@ int verifyBatchedHash()
 
             BFReg Ab[4];
             for(int k=0;k<4;++k){
-                Ab[k].lo=_mm512_set1_pd(bits2d(getSmallPos(program.getEntropy(2*k))));
-                Ab[k].hi=_mm512_set1_pd(bits2d(getSmallPos(program.getEntropy(2*k+1))));
+                Ab[k].lo=_mm512_set1_pd(bitsToDouble(getSmallPositiveFloatBits(program.getEntropy(2*k))));
+                Ab[k].hi=_mm512_set1_pd(bitsToDouble(getSmallPositiveFloatBits(program.getEntropy(2*k+1))));
             }
             FullProg fp; fp.count=(int)RandomX_CurrentConfig.ProgramSize;
             for(int i=0;i<fp.count;++i) translateFull(btT[i], nregT, fp.ins[i], true);
@@ -563,10 +549,10 @@ int verifyBatchedHash()
                 for(int k=0;k<IREGS;++k)
                     if(rOut[k][lane]!=rf->r[k]){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d R%d\n",n,chain,lane,k); ++fails; }
                 for(int k=0;k<4;++k){
-                    if(d2bits(Fblo[k][lane])!=d2bits(rf->f[k].lo)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.lo\n",n,chain,lane,k); ++fails; }
-                    if(d2bits(Fbhi[k][lane])!=d2bits(rf->f[k].hi)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.hi\n",n,chain,lane,k); ++fails; }
-                    if(d2bits(Fblo[k+4][lane])!=d2bits(rf->e[k].lo)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.lo\n",n,chain,lane,k+4); ++fails; }
-                    if(d2bits(Fbhi[k+4][lane])!=d2bits(rf->e[k].hi)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.hi\n",n,chain,lane,k+4); ++fails; }
+                    if(doubleToBits(Fblo[k][lane])!=doubleToBits(rf->f[k].lo)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.lo\n",n,chain,lane,k); ++fails; }
+                    if(doubleToBits(Fbhi[k][lane])!=doubleToBits(rf->f[k].hi)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.hi\n",n,chain,lane,k); ++fails; }
+                    if(doubleToBits(Fblo[k+4][lane])!=doubleToBits(rf->e[k].lo)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.lo\n",n,chain,lane,k+4); ++fails; }
+                    if(doubleToBits(Fbhi[k+4][lane])!=doubleToBits(rf->e[k].hi)){ if(fails<8) printf("  MISMATCH hash %d chain %u lane %d F%d.hi\n",n,chain,lane,k+4); ++fails; }
                 }
             }
             if(chain+1<PC) rx_blake2b_default(tempHash, sizeof(tempHash), rf, sizeof(randomx::RegisterFile));
@@ -617,8 +603,6 @@ int verifyPerLaneFull()
     uint64_t* spInit=(uint64_t*)malloc((size_t)LANES*spWords*8);
     uint64_t* spS=(uint64_t*)malloc((size_t)spWords*8);
     if(!spB||!spInit||!spS){ printf("  13: alloc failed\n"); free(spB); free(spInit); free(spS); return 1; }
-    auto floatMask=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>60)<<4; x<<=52; return (e&((1ULL<<22)-1))|x; };
-    auto d2b=[](double x){uint64_t b;memcpy(&b,&x,8);return b;};
 
     for(int t=0;t<TRIALS;++t){
         static FullProg fp[LANES];
@@ -633,8 +617,8 @@ int verifyPerLaneFull()
             randomx::Program program;
             fillAes4Rx4<false>(seed, 128 + PS*8, &program);
             randomx::BytecodeMachine bm; bm.compileProgram(program, bt[l], nregT[l]);
-            cfg[l].eMask[0]=floatMask(program.getEntropy(14));
-            cfg[l].eMask[1]=floatMask(program.getEntropy(15));
+            cfg[l].eMask[0]=floatMaskBits(program.getEntropy(14));
+            cfg[l].eMask[1]=floatMaskBits(program.getEntropy(15));
             memcpy(&emlo[l],&cfg[l].eMask[0],8); memcpy(&emhi[l],&cfg[l].eMask[1],8);
             fp[l].count=PS;
             for(int i=0;i<PS;++i) translateFull(bt[l][i], nregT[l], fp[l].ins[i], true);
@@ -678,11 +662,11 @@ int verifyPerLaneFull()
             for(int k=0;k<IREGS;++k) if(rOut[k][l]!=nregT[l].r[k]){ if(fails<8) printf("  MISMATCH trial %d lane %d R%d\n",t,l,k); ++fails; }
             alignas(16) double s2[2];
             for(int k=0;k<4;++k){ _mm_store_pd(s2,nregT[l].f[k]);
-                if(d2b(Flo[k][l])!=d2b(s2[0])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.lo\n",t,l,k);++fails;}
-                if(d2b(Fhi[k][l])!=d2b(s2[1])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.hi\n",t,l,k);++fails;} }
+                if(doubleToBits(Flo[k][l])!=doubleToBits(s2[0])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.lo\n",t,l,k);++fails;}
+                if(doubleToBits(Fhi[k][l])!=doubleToBits(s2[1])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.hi\n",t,l,k);++fails;} }
             for(int k=0;k<4;++k){ _mm_store_pd(s2,nregT[l].e[k]);
-                if(d2b(Flo[k+4][l])!=d2b(s2[0])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.lo\n",t,l,k+4);++fails;}
-                if(d2b(Fhi[k+4][l])!=d2b(s2[1])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.hi\n",t,l,k+4);++fails;} }
+                if(doubleToBits(Flo[k+4][l])!=doubleToBits(s2[0])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.lo\n",t,l,k+4);++fails;}
+                if(doubleToBits(Fhi[k+4][l])!=doubleToBits(s2[1])){if(fails<8)printf("  MISMATCH trial %d lane %d F%d.hi\n",t,l,k+4);++fails;} }
         }
     }
     free(spB); free(spInit); free(spS);
@@ -703,9 +687,6 @@ void batchedHash8(const uint64_t* dataset, uint64_t* spB, uint64_t spWords,
     const uint64_t spBytes = RandomX_CurrentConfig.ScratchpadL3_Size;
     const int PS = (int)RandomX_CurrentConfig.ProgramSize;
 
-    auto getSmallPos=[](uint64_t e)->uint64_t{ uint64_t exp=e>>59, man=e&((1ULL<<52)-1); exp+=1023; exp&=2047; exp<<=52; return exp|man; };
-    auto bits2d=[](uint64_t b)->double{ double d; memcpy(&d,&b,8); return d; };
-    auto floatMask=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>60)<<4; x<<=52; return (e&((1ULL<<22)-1))|x; };
 
     alignas(16) uint64_t tempHash[LANES][8];
     for(int l=0;l<LANES;++l) rx_blake2b_default(tempHash[l], 64, blobs[l], inputSize);
@@ -730,15 +711,15 @@ void batchedHash8(const uint64_t* dataset, uint64_t* spB, uint64_t spWords,
             randomx::NativeRegisterFile nregT;
             randomx::BytecodeMachine bm; bm.compileProgram(program, bt[l], nregT);
             randomx::ProgramConfiguration cfg;
-            cfg.eMask[0]=floatMask(program.getEntropy(14)); cfg.eMask[1]=floatMask(program.getEntropy(15));
+            cfg.eMask[0]=floatMaskBits(program.getEntropy(14)); cfg.eMask[1]=floatMaskBits(program.getEntropy(15));
             uint64_t ar=program.getEntropy(12);
             r0v[l]=0+(ar&1); ar>>=1; r1v[l]=2+(ar&1); ar>>=1; r2v[l]=4+(ar&1); ar>>=1; r3v[l]=6+(ar&1);
             ma0v[l]=(long long)(uint32_t)(program.getEntropy(8)&CacheLineAlignMask);
             mx0v[l]=(long long)(uint32_t)(program.getEntropy(10));
             dsoffv[l]=(long long)((program.getEntropy(13)%(DatasetExtraItems+1))*randomx::CacheLineSize);
             memcpy(&emlo[l],&cfg.eMask[0],8); memcpy(&emhi[l],&cfg.eMask[1],8);
-            for(int k=0;k<4;++k){ aLo[k][l]=bits2d(getSmallPos(program.getEntropy(2*k)));
-                                  aHi[k][l]=bits2d(getSmallPos(program.getEntropy(2*k+1))); }
+            for(int k=0;k<4;++k){ aLo[k][l]=bitsToDouble(getSmallPositiveFloatBits(program.getEntropy(2*k)));
+                                  aHi[k][l]=bitsToDouble(getSmallPositiveFloatBits(program.getEntropy(2*k+1))); }
             fp[l].count=PS; for(int i=0;i<PS;++i) translateFull(bt[l][i], nregT, fp[l].ins[i], true);
         }
 
@@ -875,10 +856,8 @@ int verifyBatchedExecute()
         randomx::BytecodeMachine bmT; bmT.compileProgram(program, btT, nregT);
 
         randomx::ProgramConfiguration cfg;
-        auto staticExp=[&](uint64_t e){ uint64_t x=0x300; x|=(e>>(64-4))<<4; x<<=52; return x; };
-        auto floatMask=[&](uint64_t e){ return (e & ((1ULL<<22)-1)) | staticExp(e); };
-        cfg.eMask[0]=floatMask(program.getEntropy(14));
-        cfg.eMask[1]=floatMask(program.getEntropy(15));
+        cfg.eMask[0]=floatMaskBits(program.getEntropy(14));
+        cfg.eMask[1]=floatMaskBits(program.getEntropy(15));
         uint64_t ar=program.getEntropy(12);
         cfg.readReg0=0+(ar&1); ar>>=1; cfg.readReg1=2+(ar&1); ar>>=1;
         cfg.readReg2=4+(ar&1); ar>>=1; cfg.readReg3=6+(ar&1);
@@ -949,12 +928,10 @@ int verifyBatchedExecute()
 
             for(int k=0;k<IREGS;++k)
                 if(rB[k][lane]!=nr.r[k]){ if(fails<8) printf("  MISMATCH prog %d lane %d R%d\n",p,lane,k); ++fails; }
-            auto cmpF=[&](int gidx,double blo,double bhi,rx_vec_f128 sv){
-                alignas(16) double s[2]; _mm_store_pd(s,sv);
-                uint64_t xb,xs; memcpy(&xb,&blo,8); memcpy(&xs,&s[0],8);
-                if(xb!=xs){ if(fails<8) printf("  MISMATCH prog %d lane %d F%d.lo\n",p,lane,gidx); ++fails; }
-                memcpy(&xb,&bhi,8); memcpy(&xs,&s[1],8);
-                if(xb!=xs){ if(fails<8) printf("  MISMATCH prog %d lane %d F%d.hi\n",p,lane,gidx); ++fails; }
+            auto cmpF=[&](int gidx, double blo, double bhi, rx_vec_f128 sv){
+                alignas(16) double s[2]; _mm_store_pd(s, sv);
+                if (!floatBitsEqualOrNaN(blo, s[0])) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.lo\n",p,lane,gidx); ++fails; }
+                if (!floatBitsEqualOrNaN(bhi, s[1])) { if(fails<6) printf("  MISMATCH prog %d lane %d F%d.hi\n",p,lane,gidx); ++fails; }
             };
             for(int k=0;k<4;++k) cmpF(k,   Fblo[k][lane],   Fbhi[k][lane],   nr.f[k]);
             for(int k=0;k<4;++k) cmpF(k+4, Fblo[k+4][lane], Fbhi[k+4][lane], nr.e[k]);
