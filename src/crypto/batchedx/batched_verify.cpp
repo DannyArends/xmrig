@@ -354,7 +354,7 @@ int verifyProgram()
 
 static int verifyProgramFullImpl(bool cfround, const char* stage)
 {
-    _mm_setcsr(0x9FC0);
+    _mm_setcsr(kMxcsrDefault);
     RandomX_CurrentConfig.Apply();
     printf("== BatchedVm Stage %s: full real-program verify%s ==\n",
            stage, cfround ? " (per-lane CFROUND)" : " (vs executeBytecode)");
@@ -470,7 +470,7 @@ static int verifyProgramFullImpl(bool cfround, const char* stage)
 // Heavy: builds the real FastMode (~2 GiB) dataset via xmrig Rx (run locally).
 int verifyBatchedHash()
 {
-    _mm_setcsr(0x9FC0);
+    _mm_setcsr(kMxcsrDefault);
     RandomX_CurrentConfig.Apply();
     printf("== BatchedVm Stage 8: full batched hash (vs randomx_calculate_hash) ==\n");
 
@@ -604,7 +604,7 @@ int verifyBatchedHash()
 // ---- Stage 13: unified per-lane interpreter — 8 DIFFERENT programs vs 8x executeBytecode ----
 int verifyPerLaneFull()
 {
-    _mm_setcsr(0x9FC0);
+    _mm_setcsr(kMxcsrDefault);
     RandomX_CurrentConfig.Apply();
     printf("== BatchedVm Stage 13: unified per-lane interpreter (8 different programs) ==\n");
     const int TRIALS = 200;
@@ -697,7 +697,7 @@ int verifyPerLaneFull()
 void batchedHash8(const uint64_t* dataset, uint64_t* spB, uint64_t spWords,
                   const void* const* blobs, size_t inputSize, uint8_t* out)
 {
-    _mm_setcsr(0x9FC0);
+    _mm_setcsr(kMxcsrDefault);
     const uint32_t ITER    = RandomX_CurrentConfig.ProgramIterations;
     const uint32_t PC      = RandomX_CurrentConfig.ProgramCount;
     const uint64_t spBytes = RandomX_CurrentConfig.ScratchpadL3_Size;
@@ -801,7 +801,7 @@ bool batchedMine(size_t N, const uint64_t* dataset, uint8_t* scratchpad, size_t 
 // ---- Stage 14: full per-lane hash — 8 DIFFERENT nonces vs 8x randomx_calculate_hash ----
 int verifyPerLaneHash()
 {
-    _mm_setcsr(0x9FC0);
+    _mm_setcsr(kMxcsrDefault);
     RandomX_CurrentConfig.Apply();
     printf("== BatchedVm Stage 14: full per-lane hash via batchedHash8 (8 different nonces) ==\n");
     const uint64_t spWords = RandomX_CurrentConfig.ScratchpadL3_Size / 8;
@@ -842,7 +842,7 @@ int verifyProgramFullRounded() { return verifyProgramFullImpl(true,  "6c"); }
 // framing; both sides share one reduced pseudo-random dataset (masked identically).
 int verifyBatchedExecute()
 {
-    _mm_setcsr(0x9FC0);
+    _mm_setcsr(kMxcsrDefault);
     RandomX_CurrentConfig.Apply();
     printf("== BatchedVm Stage 7: batched execute() loop (vs execute() transcription) ==\n");
 

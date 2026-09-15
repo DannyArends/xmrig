@@ -78,9 +78,7 @@ void runMemoryProgram(uint64_t regs[IREGS][LANES], const BInsn* prog, int count,
     for (int k = 0; k < IREGS; ++k) r[k] = _mm512_loadu_si512((const void*)regs[k]);
 
     // per-lane base word offset (lane L at L*spWords)
-    const __m512i laneBase = _mm512_set_epi64(
-        (long long)(7*spWords), (long long)(6*spWords), (long long)(5*spWords), (long long)(4*spWords),
-        (long long)(3*spWords), (long long)(2*spWords), (long long)(1*spWords), 0LL);
+    const __m512i laneBase = makeLaneBase(spWords);
 
     for (int i = 0; i < count; ++i) {
         const BInsn& in = prog[i];
@@ -230,9 +228,7 @@ void runBytecodeVec(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
                     uint64_t* sp, uint64_t spWords,
                     const uint64_t eMask[2], const FullProg& prog, int rmode[LANES])
 {
-    const __m512i laneBase = _mm512_set_epi64(
-        (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
-        (long long)(3*spWords),(long long)(2*spWords),(long long)(1*spWords),0LL);
+    const __m512i laneBase = makeLaneBase(spWords);
     // E-mask as doubles (per element0/1)
     const __m512d eMaskLo = _mm512_castsi512_pd(_mm512_set1_epi64((long long)eMask[0]));
     const __m512d eMaskHi = _mm512_castsi512_pd(_mm512_set1_epi64((long long)eMask[1]));
@@ -339,7 +335,7 @@ void runBytecodeVec(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
                 for(int l=0;l<LANES;++l) if(pc[l]==pos) sub[rmode[l]]|=(__mmask8)(1u<<l);
                 for(int md=0;md<4;++md){
                     if(!sub[md]) continue;
-                    _mm_setcsr(0x9FC0u|((unsigned)md<<13));
+                    setRoundingMode(md);
                     __mmask8 sm=sub[md];
                     switch(fi.fop){
                         case FB_FADD_R: case FB_FADD_M:
@@ -382,9 +378,7 @@ void runBatchedExecute(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
                        uint64_t datasetOffset, const uint64_t* dataset, uint64_t dmask,
                        uint32_t iterations, int rmode[LANES])
 {
-    const __m512i laneBase = _mm512_set_epi64(
-        (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
-        (long long)(3*spWords),(long long)(2*spWords),(long long)(1*spWords),0LL);
+    const __m512i laneBase = makeLaneBase(spWords);
     const __m512d eMaskLo  = _mm512_castsi512_pd(_mm512_set1_epi64((long long)eMask[0]));
     const __m512d eMaskHi  = _mm512_castsi512_pd(_mm512_set1_epi64((long long)eMask[1]));
     const __m512d mantMask = _mm512_castsi512_pd(_mm512_set1_epi64((long long)E_MANTISSA_MASK));
@@ -500,9 +494,7 @@ void runBytecodeVecPerLane(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
                            __m512d eMaskLo, __m512d eMaskHi,
                            const FullProg* prog, int rmode[LANES])
 {
-    const __m512i laneBase = _mm512_set_epi64(
-        (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
-        (long long)(3*spWords),(long long)(2*spWords),(long long)(1*spWords),0LL);
+    const __m512i laneBase = makeLaneBase(spWords);
     const __m512d mantMask = _mm512_castsi512_pd(_mm512_set1_epi64((long long)E_MANTISSA_MASK));
     const int count = prog[0].count;
     const bool tweak = RandomX_CurrentConfig.Tweak_V2_CFROUND;
@@ -627,7 +619,7 @@ void runBytecodeVecPerLane(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
                 __mmask8 mm=_mm512_cmpeq_epi64_mask(_mm512_loadu_si512(rmv),_mm512_set1_epi64(md));
                 __mmask8 a=addr_&mm, b=subr_&mm, c=mulr_&mm, e=divr_&mm, g=sqrr_&mm;
                 if(!(a|b|c|e|g)) continue;
-                _mm_setcsr(0x9FC0u|((unsigned)md<<13));
+                setRoundingMode(md);
                 if(a){ nf.lo=_mm512_mask_add_pd(nf.lo,a,fd.lo,slo); nf.hi=_mm512_mask_add_pd(nf.hi,a,fd.hi,shi); }
                 if(b){ nf.lo=_mm512_mask_sub_pd(nf.lo,b,fd.lo,slo); nf.hi=_mm512_mask_sub_pd(nf.hi,b,fd.hi,shi); }
                 if(c){ nf.lo=_mm512_mask_mul_pd(nf.lo,c,fd.lo,slo); nf.hi=_mm512_mask_mul_pd(nf.hi,c,fd.hi,shi); }
@@ -657,9 +649,7 @@ void runBatchedExecutePerLane(__m512i r[IREGS], BFReg F[8], const BFReg A[4],
                               __m512i datasetOffset, const uint64_t* dataset, uint64_t dmask,
                               uint32_t iterations, int rmode[LANES])
 {
-    const __m512i laneBase = _mm512_set_epi64(
-        (long long)(7*spWords),(long long)(6*spWords),(long long)(5*spWords),(long long)(4*spWords),
-        (long long)(3*spWords),(long long)(2*spWords),(long long)(1*spWords),0LL);
+    const __m512i laneBase = makeLaneBase(spWords);
     const __m512d mantMask = _mm512_castsi512_pd(_mm512_set1_epi64((long long)E_MANTISSA_MASK));
     const __m512i sp3mask  = _mm512_set1_epi64((long long)(uint32_t)ScratchpadL3Mask64);
     const __m512i clmask   = _mm512_set1_epi64((long long)(uint64_t)CacheLineAlignMask);

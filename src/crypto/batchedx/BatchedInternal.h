@@ -35,6 +35,9 @@ namespace batchedx {
 
 static constexpr int FREGS = 4;   // RandomX f-group registers
 
+// RandomX default MXCSR: flush-to-zero, denormals-are-zero, round-to-nearest, exceptions off.
+static constexpr unsigned kMxcsrDefault = 0x9FC0u;
+
 // ---- float op set (Stage 3 / float verify) ----
 enum FOp : uint8_t { F_FSWAP_R, F_FADD_R, F_FSUB_R, F_FMUL_R, F_FSQRT_R, F_FSCAL_R };
 struct FInsn { FOp op; uint8_t dst; uint8_t src; };   // dst/src index 0..FREGS-1
@@ -63,6 +66,15 @@ struct FullProg { FullInsn ins[512]; int count; };
 #endif
 static inline uint64_t s_rotr(uint64_t x, unsigned c) { c &= 63; return c ? (x >> c) | (x << (64 - c)) : x; }
 static inline uint64_t s_rotl(uint64_t x, unsigned c) { c &= 63; return c ? (x << c) | (x >> (64 - c)) : x; }
+
+/** Word-index of each lane's scratchpad region: lane l starts at l*spWords. */
+static inline __m512i makeLaneBase(uint64_t spWords) {
+    return _mm512_set_epi64((long long)(7*spWords), (long long)(6*spWords), (long long)(5*spWords), (long long)(4*spWords),
+                            (long long)(3*spWords), (long long)(2*spWords), (long long)(1*spWords), 0LL);
+}
+
+/** Set MXCSR to the RandomX default with rounding mode (0..3) applied. */
+static inline void setRoundingMode(int mode) { _mm_setcsr(kMxcsrDefault | ((unsigned)mode << 13)); }
 
 /** Scalar reference for one register-only integer op (IADD_RS..ISMULH_R, ISWAP_R). */
 static inline void applyScalarIntOp(uint64_t regs[IREGS], const BInsn& in, uint64_t s) {
