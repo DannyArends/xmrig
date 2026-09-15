@@ -1,8 +1,8 @@
 # .github/workflows/batchedX.yml
-name: batchedX
+name: batchedX-avx512
 on:
   push:
-    branches: [batched-avx512]
+    branches: [batchedX-avx512]
   workflow_dispatch:
 
 jobs:
