@@ -4,8 +4,8 @@
 program and scratchpad. One `__m512i` per integer register, one `BFReg` per float
 register, all 8 lanes in lockstep.
 
-It's bit-exact against randomX in xmrig: full instruction set, CFROUND, memory, the 
-whole hash. It was tested and mines real shares on P2Pool. It works. It's also slow.
+It's bit-exact against RandomX in xmrig: full instruction set, CFROUND, memory, the 
+whole hash. It was tested and mines real shares on P2Pool. It works, it's slow.
 
 ## What's where
 
@@ -17,16 +17,18 @@ whole hash. It was tested and mines real shares on P2Pool. It works. It's also s
 - `batched_ref.cpp` : scalar oracle, verify only
 - `batched_verify.cpp` : the verify stages plus `batchedHash8()`
 
-The three things that matter:
+The four main functions:
 
 - `batchedHash8(dataset, scratchpad, spWords, blobs[8], inputSize, out)` : hand it 8
-  blobs, get 8 hashes. That's the whole miner-facing surface.
+  blobs, get 8 hashes. The hasher.
+- `batchedMine(...)` : the mining hook. Decides whether the batched path applies (N==8,
+  fast mode, plain rx/0) and calls `batchedHash8`. All the mining logic lives here so the
+  seam into xmrig stays tiny.
 - `runBytecodeVecPerLane(...)` : the per-lane interpreter. 8 different programs, each
   on its own pc. Int, branch, memory, float, CFROUND.
 - `runBatchedExecutePerLane(...)` : the VM loop around it.
 
-Per-lane register access is `selectReg`/`scatterReg` (and the float versions). That's
-where a chunk of the cost lives, see below.
+Per-lane register access is `selectReg`/`scatterReg` (and the float versions).
 
 ## Build and check
 
@@ -43,6 +45,36 @@ Needs AVX-512F + DQ. To prove it's correct:
 That runs Stages 1 to 14, all bit-exact vs xmrig. 1 to 8 are the shared-program path,
 9 to 14 are the real thing: 8 different nonces through the full per-lane hash vs
 `randomx_calculate_hash`.
+
+## Mine
+
+Mining goes through xmrig's CPU worker. Batched RandomX runs at intensity 8, and calls 
+`batchedMine`). Build with `-DWITH_BATCHEDX=ON`, then drop a `config.json` next to the 
+compiled binary:
+
+```json
+{
+    "autosave": false,
+    "cpu": {
+        "enabled": true,
+        "huge-pages": true,
+        "rx": { "intensity": 8, "threads": 8, "affinity": -1 }
+    },
+    "randomx": { "mode": "fast", "1gb-pages": false },
+    "pools": [
+        { "url": "127.0.0.1:3333", "user": "x", "pass": "x", "algo": "rx/0" }
+    ]
+}
+```
+
+```
+./xmrig -c config.json
+```
+
+Two settings: `intensity: 8` picks the batched path (`CpuWorker<8>`), and `mode: fast` 
+gives it the full dataset it needs. Only `rx/0`, miner-signature and commitment variants 
+fall back to the JIT. Wait for `accepted`, then you're mining 8-wide. Set `threads` to 
+your core count. And yeah, it's slow.
 
 ## On the speed
 
